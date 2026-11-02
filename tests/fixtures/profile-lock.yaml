@@ -1,0 +1,45 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: false
+
+importers:
+
+  .:
+    dependencies:
+      '@deepseek-ai/dsh-base':
+        specifier: 0.2.1-rc.3
+        version: 0.2.1-rc.3
+      dsh-channel-hub:
+        specifier: github:Seraphoenixy/dsh-channel-hub
+        version: https://codeload.github.com/Seraphoenixy/dsh-channel-hub/tar.gz/8b5f49914aa56c8c544a70abe38e134b5148a261(@deepseek-ai/schemastery@3.18.5)
+      dsh-cost-meter:
+        specifier: ^1.9.28
+        version: 1.9.28(@deepseek-ai/schemastery@3.18.5)
+      dsh-local-plugin:
+        specifier: file:../local-plugin
+        version: file:../local-plugin
+      dsh-packed-plugin:
+        specifier: ./vendor/dsh-packed-plugin-1.0.0.tgz
+        version: file:vendor/dsh-packed-plugin-1.0.0.tgz
+
+packages:
+
+  '@deepseek-ai/dsh-base@0.2.1-rc.3':
+    resolution: {integrity: sha512-hostbase}
+
+  dsh-channel-hub@https://codeload.github.com/Seraphoenixy/dsh-channel-hub/tar.gz/8b5f49914aa56c8c544a70abe38e134b5148a261:
+    resolution: {gitHosted: true, integrity: sha512-uoiHSn6V0pG5xCXq, tarball: https://codeload.github.com/Seraphoenixy/dsh-channel-hub/tar.gz/8b5f49914aa56c8c544a70abe38e134b5148a261}
+    version: 0.1.0-alpha.1
+
+  dsh-cost-meter@1.9.28:
+    resolution: {integrity: sha512-aizlBxDGE0Q1ISvbGG25AlLMC}
+    version: 1.9.28
+
+  dsh-local-plugin@file:../local-plugin:
+    resolution: {directory: ../local-plugin, type: directory}
+    version: 0.0.1
+
+  dsh-packed-plugin@file:vendor/dsh-packed-plugin-1.0.0.tgz:
+    resolution: {integrity: sha512-packed, tarball: file:vendor/dsh-packed-plugin-1.0.0.tgz}
+    version: 1.0.0

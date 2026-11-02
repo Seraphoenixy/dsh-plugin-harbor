@@ -1,0 +1,57 @@
+{
+  "name": "dsh-plugin-harbor",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "description": "DSH 插件港湾：插件市场浏览与已装插件管理（数据来自 dsh-plugin.org）",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./dist/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "LICENSE",
+    "docs/ACCEPTANCE.md",
+    "dist/index.js",
+    "dist/client.js",
+    "dist/catalog-worker.js"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test --experimental-transform-types tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build && npm run test:client && npm run test:host && npm run test:package",
+    "test:client": "node --test tests/client.test.mjs",
+    "test:host": "node scripts/verify-host.mjs",
+    "test:package": "node scripts/verify-package.mjs",
+    "pack:local": "node scripts/pack.mjs",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/*\" \"scripts/*.mjs\""
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "esbuild": "0.25.12",
+    "prettier": "3.6.2",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  }
+}

@@ -1,0 +1,393 @@
+/*
+ * 插件港湾样式。
+ *
+ * 约定（与参考项目 channel-hub 同口径）：
+ * - 全部类名以 `pc` 前缀，宿主令牌 `--dsw-alias-*` 优先、缺省值兜底；
+ * - **页面本身不滚动**，只有 `.pc-body` 滚动：`.pc` 必须 min-width/min-height:0
+ *   + height:100% + overflow:hidden，否则宿主主区域里的 flex:1 会失效、整页被
+ *   内容撑高滚走，页签不再固定。
+ * - 颜色不做硬编码，跟随宿主明暗主题。
+ */
+.pc{
+  --pc-text:var(--dsw-alias-label-primary,var(--text-primary,inherit));
+  --pc-text-2:var(--dsw-alias-label-secondary,#6b7280);
+  --pc-text-3:var(--dsw-alias-label-tertiary,#9ca3af);
+  --pc-line:var(--dsw-alias-border-l2,rgba(128,128,128,.28));
+  --pc-line-soft:var(--dsw-alias-border-l1,rgba(128,128,128,.16));
+  --pc-layer-1:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.06));
+  --pc-layer-2:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.09));
+  --pc-accent:var(--dsw-alias-state-business-primary,#5785dd);
+  --pc-err:var(--dsw-alias-state-error-primary,#d55b5b);
+  --pc-ok:var(--dsw-alias-state-success-primary,#2f9e6b);
+  --pc-warn:var(--dsw-alias-state-warning-primary,#d6922f);
+  display:flex;
+  flex-direction:column;
+  gap:14px;
+  width:100%;
+  box-sizing:border-box;
+  color:var(--pc-text);
+  font-size:15px;
+  line-height:1.55;
+  min-width:0;
+  min-height:0;
+  height:100%;
+  padding:0 clamp(16px,2.4vw,40px) 0;
+  overflow:hidden;
+}
+.pc *{box-sizing:border-box}
+.pc h2,.pc h3,.pc p,.pc dl,.pc dd,.pc dt{margin:0}
+.pc h2{font-size:27px;line-height:1.2;font-weight:760;letter-spacing:-.02em}
+.pc h3{font-size:16px;line-height:1.35;font-weight:680}
+.pc-head{
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+  padding-top:22px;
+}
+.pc-title{display:flex;align-items:baseline;gap:10px;min-width:0}
+.pc-ver{color:var(--pc-text-3);font-size:13px;font-variant-numeric:tabular-nums}
+.pc-actions{display:flex;align-items:center;gap:8px}
+.pc-btn{
+  appearance:none;
+  border:1px solid var(--pc-line);
+  background:var(--pc-layer-1);
+  color:var(--pc-text);
+  border-radius:8px;
+  padding:6px 12px;
+  font-size:13.5px;
+  cursor:pointer;
+}
+.pc-btn:hover{background:var(--pc-layer-2)}
+.pc-tabs{
+  display:flex;
+  align-items:center;
+  gap:4px;
+  border-bottom:1px solid var(--pc-line-soft);
+  flex-wrap:wrap;
+}
+.pc-tab{
+  appearance:none;
+  border:0;
+  background:transparent;
+  color:var(--pc-text-2);
+  padding:8px 12px;
+  font-size:14px;
+  cursor:pointer;
+  border-bottom:2px solid transparent;
+}
+.pc-tab.is-on{color:var(--pc-text);border-bottom-color:var(--pc-accent);font-weight:620}
+.pc-body{
+  flex:1;
+  min-height:0;
+  overflow:auto;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  padding-bottom:24px;
+}
+.pc-card{
+  border:1px solid var(--pc-line-soft);
+  border-radius:12px;
+  background:var(--pc-layer-1);
+  padding:14px 16px;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.pc-note{color:var(--pc-text-2);font-size:13.5px}
+.pc-error{
+  border:1px solid var(--pc-err);
+  border-radius:10px;
+  padding:10px 12px;
+  color:var(--pc-err);
+  font-size:13.5px;
+  word-break:break-word;
+}
+.pc-kv{display:grid;grid-template-columns:minmax(96px,auto) 1fr;gap:4px 14px}
+.pc-kv-row{display:contents}
+.pc-kv dt{color:var(--pc-text-3);font-size:13px}
+.pc-kv dd{
+  font-size:13px;
+  min-width:0;
+  overflow-wrap:anywhere;
+  font-variant-numeric:tabular-nums;
+}
+/* ---- 市场页 ---- */
+.pc-market{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  min-height:0;
+  flex:1;
+}
+.pc-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pc-search{
+  flex:1 1 240px;
+  min-width:180px;
+  appearance:none;
+  border:1px solid var(--pc-line);
+  background:var(--pc-layer-1);
+  color:var(--pc-text);
+  border-radius:8px;
+  padding:7px 11px;
+  font-size:13.5px;
+}
+.pc-search::placeholder{color:var(--pc-text-3)}
+.pc-select{
+  appearance:none;
+  border:1px solid var(--pc-line);
+  background:var(--pc-layer-1);
+  color:var(--pc-text);
+  border-radius:8px;
+  padding:7px 10px;
+  font-size:13.5px;
+}
+.pc-btn[disabled]{opacity:.55;cursor:default}
+/*
+ * 分类条：允许横向滚动而不是把工具栏撑破。
+ * 父级 `.pc-market` 是 flex 列，这里必须 min-width:0 才不会把整页顶宽。
+ */
+.pc-tabs.is-sub{
+  border-bottom:0;
+  gap:2px;
+  overflow-x:auto;
+  min-width:0;
+  padding-bottom:2px;
+}
+.pc-tabs.is-sub .pc-tab{padding:5px 9px;font-size:13px;white-space:nowrap}
+.pc-tabs.is-sub .pc-tab.is-on{background:var(--pc-layer-2);border-bottom-color:transparent;border-radius:7px}
+.pc-summary{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  flex-wrap:wrap;
+  color:var(--pc-text-3);
+  font-size:12.5px;
+  font-variant-numeric:tabular-nums;
+}
+.pc-error-inline{color:var(--pc-err)}
+/*
+ * 列表容器：**只有它滚动**。
+ * 窗口化渲染依赖「行高固定 + 上下占位块撑起滚动条」，因此这里不设
+ * `scroll-behavior:smooth`，也不允许行高随内容变化（描述用单行省略）。
+ */
+.pc-list{
+  flex:1;
+  min-height:0;
+  overflow:auto;
+  border:1px solid var(--pc-line-soft);
+  border-radius:12px;
+  background:var(--pc-layer-1);
+  padding:0 12px;
+}
+.pc-list-spacer{width:100%}
+.pc-row{
+  height:64px;
+  display:flex;
+  align-items:center;
+  gap:14px;
+  border-bottom:1px solid var(--pc-line-soft);
+  min-width:0;
+}
+.pc-row:last-of-type{border-bottom:0}
+.pc-row-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:2px}
+.pc-row-title{display:flex;align-items:baseline;gap:8px;min-width:0}
+.pc-row-name{font-size:14px;font-weight:620;white-space:nowrap}
+.pc-row-repo{
+  color:var(--pc-text-3);
+  font-size:12px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  min-width:0;
+}
+/*
+ * 可点的仓库地址（外链，交给系统浏览器打开）。
+ * 用下划线而不是只靠颜色：色弱用户也要能看出这是链接；hover 才变主题色，
+ * 平时保持与原来一致的灰，避免整列表花掉。
+ */
+.pc-row-repo.is-link{
+  text-decoration:underline;
+  text-decoration-color:color-mix(in srgb,var(--pc-text-3) 55%,transparent);
+  text-underline-offset:2px;
+  cursor:pointer;
+}
+.pc-row-repo.is-link:hover{color:var(--pc-accent);text-decoration-color:currentColor}
+/* 「源站」按钮是 `<a>`：去掉链接默认样式，外观与相邻按钮一致 */
+a.pc-btn{display:inline-flex;align-items:center;text-decoration:none;line-height:1.5}
+.pc-row-desc{
+  color:var(--pc-text-2);
+  font-size:12.5px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.pc-row-meta{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex:none;
+  color:var(--pc-text-3);
+  font-size:12px;
+  font-variant-numeric:tabular-nums;
+}
+.pc-chip{
+  border:1px solid var(--pc-line);
+  border-radius:999px;
+  padding:1px 7px;
+  font-size:11.5px;
+  white-space:nowrap;
+}
+.pc-chip.is-ok{color:var(--pc-ok);border-color:color-mix(in srgb,var(--pc-ok) 45%,transparent)}
+.pc-chip.is-warn{color:var(--pc-warn);border-color:color-mix(in srgb,var(--pc-warn) 45%,transparent)}
+.pc-chip.is-on{color:var(--pc-accent);border-color:color-mix(in srgb,var(--pc-accent) 45%,transparent)}
+.pc-chip.is-muted{color:var(--pc-text-3)}
+/* ---- 已装页 ---- */
+.pc-summary-inline{color:var(--pc-text-2);font-size:13px}
+/*
+ * 已装行比市场行高一档：多一行结论/说明。
+ * ⚠️ 只有已装页用这个高度 —— 市场列表的窗口化依赖固定 64px，改这里不影响它。
+ */
+.pc-row.is-tall{height:84px;align-items:flex-start;padding:10px 0}
+.pc-row-warn{color:var(--pc-err);font-size:12px;margin-top:1px}
+.pc-row-note{color:var(--pc-text-3);font-size:12px;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* ---- 变更按钮与确认弹窗 ---- */
+.pc-btn.is-small{padding:3px 9px;font-size:12px}
+.pc-btn.is-primary{background:var(--pc-accent);border-color:var(--pc-accent);color:#fff}
+.pc-btn.is-danger{color:var(--pc-err);border-color:color-mix(in srgb,var(--pc-err) 45%,transparent)}
+.pc-chip.is-err{color:var(--pc-err);border-color:color-mix(in srgb,var(--pc-err) 45%,transparent)}
+/*
+ * 弹窗：**固定在视口**，不参与面板的 flex 布局 —— 面板本身 overflow:hidden，
+ * 放在布局里会被裁掉。
+ */
+.pc-overlay{
+  position:fixed;
+  inset:0;
+  background:rgba(0,0,0,.38);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:40;
+}
+.pc-dialog{
+  width:min(520px,92vw);
+  max-height:80vh;
+  overflow:auto;
+  background:var(--dsw-alias-bg-layer-3,var(--pc-layer-2,#1f2430));
+  border:1px solid var(--pc-line);
+  border-radius:14px;
+  padding:18px 20px;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  box-shadow:0 18px 48px rgba(0,0,0,.35);
+}
+.pc-dialog-body{font-size:14px}
+.pc-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
+/* ---- 操作页 ---- */
+.pc-op{
+  border-bottom:1px solid var(--pc-line-soft);
+  padding:8px 0 10px;
+  display:flex;
+  flex-direction:column;
+  gap:5px;
+  min-width:0;
+}
+.pc-op:last-of-type{border-bottom:0}
+.pc-op-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.pc-op-kind{color:var(--pc-text-3);font-size:12px}
+.pc-op-target{font-size:13px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pc-op-time,.pc-op-progress{color:var(--pc-text-3);font-size:12px;font-variant-numeric:tabular-nums}
+.pc-op-progress{margin-left:auto}
+.pc-op-group{color:var(--pc-text-3);font-size:12px;font-weight:600;margin:10px 0 2px}
+/*
+ * 进度条：只做宽度动画，高度固定 —— 有进度条的行不会把窗口化列表的行高撑变。
+ */
+.pc-bar{height:4px;border-radius:999px;background:var(--pc-layer-2);overflow:hidden}
+.pc-bar-fill{height:100%;background:var(--pc-accent);transition:width .25s ease}
+.pc-op-log{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:11.5px;
+  line-height:1.5;
+  color:var(--pc-text-2);
+  background:var(--pc-layer-1);
+  border:1px solid var(--pc-line-soft);
+  border-radius:8px;
+  padding:8px 10px;
+  margin:0;
+  max-height:180px;
+  overflow:auto;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+/* ---- 设置页 ---- */
+.pc-card-head{display:flex;flex-direction:column;gap:2px}
+.pc-card-sub{color:var(--pc-text-3);font-size:12.5px}
+/*
+ * 表单：自适应两列（窄容器自动落成一列）。
+ * ⚠️ 字段控件用 `.pc-input` 而不是复用市场页的 `.pc-search`：后者带
+ * `flex:1 1 240px` 的搜索框语义，放进网格会算错宽度（本轮重做时踩到）。
+ */
+.pc-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px 16px}
+.pc-field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.pc-field-label{color:var(--pc-text-2);font-size:13px;font-weight:560}
+.pc-field-hint{color:var(--pc-text-3);font-size:11.5px;line-height:1.45}
+.pc-input{
+  width:100%;
+  appearance:none;
+  border:1px solid var(--pc-line);
+  background:var(--pc-layer-1);
+  color:var(--pc-text);
+  border-radius:8px;
+  padding:7px 11px;
+  font-size:13.5px;
+  min-width:0;
+}
+.pc-input:focus{outline:none;border-color:var(--pc-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--pc-accent) 22%,transparent)}
+.pc-input::placeholder{color:var(--pc-text-3)}
+select.pc-input{cursor:pointer}
+/*
+ * 保存条：右对齐动作，左侧留给「保存在哪里 / 已保存」。
+ * `.is-inline` 变体用于卡片内部（去掉外边距）。
+ */
+.pc-form-footer{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  justify-content:flex-end;
+  margin:2px 0 4px;
+}
+.pc-form-footer .pc-field-hint{margin-right:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pc-form-footer.is-inline{margin:0}
+.pc-ok-inline{color:var(--pc-ok);font-size:12.5px}
+.pc-note-block{
+  border:1px solid color-mix(in srgb,var(--pc-warn) 40%,transparent);
+  background:color-mix(in srgb,var(--pc-warn) 10%,transparent);
+  color:var(--pc-text-2);
+  border-radius:10px;
+  padding:9px 11px;
+  font-size:12.5px;
+}
+/* ---- 诊断 ---- */
+.pc-diag{display:flex;flex-direction:column;gap:2px}
+.pc-diag-row{
+  display:grid;
+  grid-template-columns:auto minmax(120px,150px) 1fr auto;
+  align-items:center;
+  gap:10px;
+  font-size:12.5px;
+  min-width:0;
+  padding:6px 8px;
+  border-radius:8px;
+}
+.pc-diag-row:nth-child(odd){background:var(--pc-layer-1)}
+.pc-diag-label{color:var(--pc-text-2);white-space:nowrap}
+.pc-diag-detail{
+  color:var(--pc-text-3);
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  min-width:0;
+}

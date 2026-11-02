@@ -1,0 +1,25 @@
+# 依赖
+node_modules/
+
+# 构建与类型缓存
+*.tsbuildinfo
+.cache/
+dist/*.map
+
+# 运行时数据：目录库、操作日志一律不入库
+.data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.lock
+
+# 打包产物
+*.tgz
+artifacts/
+
+# 本地临时目录与一次性排查脚本
+.tmp-*/
+tmp/
+
+# 日志
+*.log

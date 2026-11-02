@@ -1,0 +1,4 @@
+- insert:
+    - id: plugin-harbor
+      name: dsh-plugin-harbor
+      config: {}

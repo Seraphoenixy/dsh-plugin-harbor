@@ -1,0 +1,2 @@
+# 统一按 LF 入库（与 .editorconfig 的 end_of_line = lf 一致）
+* text=auto eol=lf

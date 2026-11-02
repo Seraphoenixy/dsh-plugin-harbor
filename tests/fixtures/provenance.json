@@ -1,0 +1,43 @@
+{
+  "fetchedAt": "2026-11-01T11:49:02.212Z",
+  "site": "https://dsh-plugin.org",
+  "api": "https://api.dsh-plugin.org",
+  "sources": {
+    "site-index-zh.html": {
+      "url": "https://dsh-plugin.org/zh/plugins",
+      "bytes": 226039,
+      "kept": "95881 字符 Flight 载荷（3 段）",
+      "parsed": {
+        "chunks": 37,
+        "totalCount": 19866
+      }
+    },
+    "site-shard-agent-1.json": {
+      "url": "https://dsh-plugin.org/directory/zh/agent-1-2ec2dd96.json",
+      "bytes": 511425,
+      "kept": "站点原始记录前 12 条（共 617 条；保留原文键名）",
+      "hash": "2ec2dd96"
+    },
+    "curated-zh.json": {
+      "url": "https://api.dsh-plugin.org/plugins.zh.json",
+      "bytes": 3437982,
+      "kept": "9 条（含 1 条不在分片夹具里的对照项）"
+    },
+    "detail-dsh-purge.html": {
+      "url": "https://dsh-plugin.org/zh/plugins/yujunzhixue/dsh-purge",
+      "bytes": 137964,
+      "kept": "该插件的记录对象 3814 字符（2 段）",
+      "parsed": {
+        "version": "v1.1.85",
+        "installType": "github",
+        "dshTarget": "",
+        "webInstallable": true
+      }
+    },
+    "sitemap-plugins-1.xml": {
+      "url": "https://dsh-plugin.org/sitemaps/plugins/1.xml",
+      "bytes": 971368,
+      "kept": "前 8 条 URL（共 2000 条）"
+    }
+  }
+}
