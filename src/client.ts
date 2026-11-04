@@ -29,18 +29,8 @@ window.__ModuleLoader__.load({
     const PANEL_ID = "plugin-harbor";
     const LABEL = "插件港湾";
 
-    /**
-     * 本面板的构建标识（与宿主侧同一个注入值）。
-     *
-     * ⚠️ 客户端 bundle 是**页面加载时从磁盘现取**的，宿主侧 `index.js` 要等重启或一次
-     * profile 重新组合才换 —— 于是会出现「面板调用新方法，宿主回
-     * `Unknown method: export.run`」。这里拿它和 `/status` 的 `build` 比对，直接把
-     * 情况和修法说清楚，而不是让用户对着那句错发愣（本轮实测的报障就是这么来的）。
-     */
+    /** 构建标识仅供诊断，不在界面展示构建差异提示。 */
     const BUILD: string = typeof __HARBOR_BUILD__ === "string" ? __HARBOR_BUILD__ : "dev";
-    const STALE_HOST_TEXT =
-      "宿主里运行的插件还是旧构建：界面已经从磁盘加载了新版本，宿主侧要等重启 DSH，或对任意" +
-      "另一个插件做一次启用 / 停用 / 更新（任何一次 profile 重新组合都会把磁盘上已变化的插件代码换进来）。";
     /** 暴露构建标识：诊断用（测试也能从注册对象上直接读到，见注册处）。 */
     (globalThis as any).__PLUGIN_HARBOR_BUILD__ = BUILD;
     const TABS = [
@@ -838,6 +828,7 @@ window.__ModuleLoader__.load({
           h("span", { className: "pc-summary-inline" }, `已装 ${rows.length} 个插件`),
         ),
         transfer ? h(Transfer, { call, onDone: onReload }) : null,
+        transfer ? h(GitSyncPanel, { call, onDone: onReload }) : null,
         h(
           "div",
           { className: "pc-summary" },
@@ -1198,6 +1189,73 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function GitSyncPanel({ call, onDone }: any) {
+      const [remote, setRemote] = useState("");
+      const [environment, setEnvironment] = useState("default");
+      const [saved, setSaved] = useState("");
+      const [preview, setPreview] = useState(null as any);
+      const [busy, setBusy] = useState(false);
+      const [message, setMessage] = useState("");
+      const [error, setError] = useState("");
+      const [dialog, setDialog] = useState(null as any);
+      useEffect(() => {
+        let active = true;
+        call("sync.get").then((r: any) => {
+          if (!active || !r.config) return;
+          setRemote(r.config.remote); setEnvironment(r.config.environment);
+          setSaved(JSON.stringify(r.config));
+        }).catch((e: any) => { if (active) setError(String(e.message ?? e)); });
+        return () => { active = false; };
+      }, [call]);
+      const run = async (method: string, payload: any = {}) => {
+        setBusy(true); setError(""); setMessage("");
+        try {
+          const result = await call(method, payload);
+          if (method === "sync.configure") { setSaved(JSON.stringify(result.config)); setPreview(null); setMessage("设置已保存，尚未联网"); }
+          if (method === "sync.preview") setPreview(result);
+          if (method === "sync.publish") { setPreview(null); setMessage(result.unchanged ? "远端内容已一致，无需新提交" : `快照已发布：${result.commit}`); }
+          if (method === "sync.apply") { setPreview(null); setMessage("已加入操作队列；普通配置将由宿主自动合并，逐项结果请查看操作页"); await onDone?.(); }
+        } catch (e: any) { setError(String(e.message ?? e)); }
+        finally { setBusy(false); }
+      };
+      const matches = saved === JSON.stringify({ remote, environment });
+      const button = (label: string, action: () => void, disabled = false) => h("button", { type: "button", className: "pc-btn", disabled: busy || disabled, onClick: action }, label);
+      return h("section", { className: "pc-card", "data-git-sync": "1" },
+        cardHead("Git 跨机器同步", "可与 Mnemon 共用仓库；使用独立 harbor-sync 分支。打开面板不联网。"),
+        h("label", { className: "pc-field" }, "仓库地址", h("input", { className: "pc-input", value: remote, disabled: busy, placeholder: "https://github.com/you/private-backup.git", onChange: (e: any) => { setRemote(e.target.value); setPreview(null); } })),
+        h("label", { className: "pc-field" }, "共享环境名", h("input", { className: "pc-input", value: environment, disabled: busy, onChange: (e: any) => { setEnvironment(e.target.value); setPreview(null); } })),
+        h("p", { className: "pc-field-hint" }, "不同机器填写相同仓库与环境名。使用系统 Git 的 SSH 或凭据管理器；建议使用私有仓库。配置脱敏后发布，凭据需在目标机器单独填写。"),
+        h("div", { className: "pc-form-footer is-inline" },
+          button("保存设置", () => setDialog({ title: "保存 Git 同步设置", body: "仅保存本机设置，不联网。", detail: `${remote}\n分支：harbor-sync\n环境：${environment}`, action: () => run("sync.configure", { remote, environment, confirm: true }) })),
+          button("检查远端并预检", () => run("sync.preview"), !matches),
+          busy ? h("button", { type: "button", className: "pc-btn", onClick: () => call("sync.cancel").catch(() => {}) }, "取消 Git 操作") : null),
+        preview && matches ? h("div", { className: "pc-note-block" },
+          h("p", null, preview.hasRemote ? `远端快照：${preview.commit}；${preview.same ? "内容一致" : "存在差异"}` : "远端尚无此环境快照，可发布本机环境"),
+          h("details", null, h("summary", null, `本机待发布：${preview.local.plugins.length} 个插件，${preview.local.configRows} 行配置`),
+            h("pre", { className: "pc-op-log" }, preview.local.plugins.map((p: any) => `${p.name} ${p.version ?? "版本未知"} ${p.enabled ? "启用" : "停用"}`).join("\n")),
+            h("details", null, h("summary", null, "完整待发布快照（含脱敏配置）"), h("pre", { className: "pc-op-log" }, preview.local.snapshot)),
+            h("p", null, "未导出项："), ...preview.local.omissions.map((x: any, i: number) => h("p", { key: i }, `${x.path}：${x.reason}`)),
+            ...preview.local.warnings.map((x: string, i: number) => h("p", { key: "w" + i }, x))),
+          preview.plan ? h(PlanView, { plan: preview.plan }) : null,
+          ...preview.versions.map((x: string, i: number) => h("p", { key: i }, x)),
+          ...(preview.configPlans ?? []).map((p: any, i: number) => h("p", { key: "config" + i, className: "pc-field-hint" },
+            `${p.plugin} / ${p.id || "无条目 ID"}：${p.action === "apply" ? "自动合并 " + p.paths.join("、") : p.action === "skip" ? "保留本机配置" : "需人工处理"}${p.reason ? "（" + p.reason + "）" : ""}${p.skipped.length ? "；凭据、路径等受保护字段已跳过 " + p.skipped.length + " 项" : ""}`)),
+          preview.snippet && preview.configPlans?.some((p: any) => p.action === "manual")
+            ? h("details", null, h("summary", null, "未自动应用的配置（查看原因与片段）"),
+                ...preview.configPlans.filter((p: any) => p.action === "manual").map((p: any, i: number) => h("p", { key: i }, `${p.plugin} / ${p.id || "无条目 ID"}：${p.reason || "无法安全自动应用"}`)),
+                h("pre", { className: "pc-op-log" }, preview.snippet)) : null,
+          preview.snippet && !Array.isArray(preview.configPlans)
+            ? h("p", { className: "pc-field-hint" }, "当前运行的服务端尚未返回自动配置计划，本次预检无法确认自动应用能力。") : null,
+          h("p", { className: "pc-field-hint" }, "发布会替换远端此环境的快照，请先核对远端差异；应用会安装缺失插件、恢复启停并通过宿主合并普通配置；保留本机凭据与路径，不自动变更已有版本。"),
+          button("发布本机快照", () => setDialog({ title: "发布本机环境快照", body: "确认将预检时的本机快照写入远端此环境目录？远端并发变化会阻止发布。", detail: `${remote}\n${environment} · ${preview.local.plugins.length} 个插件 · ${preview.local.configRows} 行脱敏配置`, action: () => run("sync.publish", { token: preview.token, confirm: true }) })),
+          preview.hasRemote ? button("应用远端快照", () => setDialog({ title: "应用远端环境", body: "确认执行上方安装、启停与配置合并计划？凭据、路径等受保护字段保留本机值；不支持的配置需人工处理。", detail: `commit：${preview.commit}\n` + preview.plan.steps.map((s: any) => `${PLAN_LABELS[s.action] ?? s.action}：${s.name}`).join("\n"), action: () => run("sync.apply", { token: preview.token, confirm: true }) })) : null,
+          h("details", null, h("summary", null, "此环境最近 10 次提交"), h("pre", { className: "pc-op-log" }, preview.history.join("\n") || "暂无历史"))) : null,
+        busy ? h("p", null, "正在处理…") : null,
+        message ? h("p", { role: "status" }, message) : null,
+        error ? h("p", { className: "pc-error", role: "alert" }, error) : null,
+        h(ConfirmDialog, { dialog, onClose: setDialog }));
+    }
+
     const PLAN_LABELS: Record<string, string> = {
       install: "将安装",
       enable: "将启用",
@@ -1236,11 +1294,13 @@ window.__ModuleLoader__.load({
               `本插件自己的设置会被覆盖：${plan.settings.changed.join("、")}`,
             )
           : null,
+        plan.builtinRows > 0 ? h("p", { className: "pc-note" }, `另有 ${plan.builtinRows} 行宿主内置配置（已脱敏保留，不参与第三方插件自动恢复）`) : null,
+        ...(plan.unresolved ?? []).map((row: any, i: number) => h("p", { key: "unresolved" + i, className: "pc-field-hint" }, `${row.id || "无条目 ID"}${row.name ? " · " + row.name : ""}：${row.reason}`)),
         plan.unattributedRows > 0
           ? h(
               "p",
               { className: "pc-note" },
-              `另有 ${plan.unattributedRows} 行补丁没归到已装插件（已原样带在导出文件里）`,
+              `另有 ${plan.unattributedRows} 行补丁归属尚未确认（已脱敏保留，不自动应用或删除）`,
             )
           : null,
         (plan.warnings ?? []).map((line: string) =>
@@ -1322,14 +1382,15 @@ window.__ModuleLoader__.load({
           typeof row.stars === "number"
             ? h("span", null, "★ " + formatStars(row.stars))
             : null,
-          // 变更动作：更新 / 卸载 / 启停。路径与压缩包装的插件没有远方版本可比，
-          // 「更新」按钮仍给出（它会原样重装），但徽标已如实标成「未判定」。
+          // 本地路径插件由用户更新源码并构建，通过热重载加载；不提供远端更新。
           h(
             "button",
             {
               type: "button",
               className: "pc-btn is-small",
-              onClick: () => onUpdate?.(row),
+              disabled: row.kind === "path" || verdict === false,
+              title: row.kind === "path" ? "本地路径插件请在源码目录更新并构建；已启用时可使用热重载" : verdict === false ? "已是最新版本" : undefined,
+              onClick: () => { if (row.kind !== "path" && verdict !== false) onUpdate?.(row); },
             },
             "更新",
           ),
@@ -1663,12 +1724,6 @@ window.__ModuleLoader__.load({
             .then((result: any) => {
               if (result?.ok === false) {
                 const message = String(result.error?.message ?? "请求失败");
-                /**
-                 * 宿主不认识这个方法 ⇒ 宿主侧跑的是旧构建（见 `STALE_HOST_TEXT`）。
-                 * 把原始报文留在末尾，便于排查别的原因。
-                 */
-                if (/Unknown method/i.test(message))
-                  throw Error(`${STALE_HOST_TEXT}（宿主回：${message}）`);
                 throw Error(message);
               }
               return result.value ?? result;
@@ -1686,23 +1741,23 @@ window.__ModuleLoader__.load({
       const [settings, setSettings] = useState(null as any);
       const [settingsError, setSettingsError] = useState("");
       const lastLive = useRef(-1);
-      /**
-       * 宿主是不是旧构建：`status.build` 与本面板的构建标识不一致（老宿主根本不报
-       * `build` 字段，同样按不一致处理）。只做提示，不拦功能 —— 旧宿主本来就没有新方法。
-       */
-      const staleHost = status !== null && (status as any)?.build !== BUILD;
-
       useEffect(() => {
         let cancelled = false;
-        (async () => {
-          setError("");
+        let pending = false;
+        const refresh = async () => {
+          if (pending) return;
+          pending = true;
           try {
+            // status 只读取本地宿主事实，不检查更新、不出网。
             const value = await call("status");
-            if (!cancelled) setStatus(value);
+            if (!cancelled) { setStatus(value); setError(""); }
           } catch (cause: any) {
             if (!cancelled) setError(String(cause?.message ?? cause));
+          } finally {
+            pending = false;
           }
-        })();
+        };
+        void refresh();
         return () => {
           cancelled = true;
         };
@@ -1767,7 +1822,7 @@ window.__ModuleLoader__.load({
 
       /**
        * 只在**有任务在跑**时轮询（1s），跑完立刻停：这样一次安装能被看到进度，
-       * 而空闲时不会有任何定时器在后台跑。
+       * 而空闲时不再轮询操作队列。
        */
       useEffect(() => {
         if (liveCount === 0) return undefined;
@@ -1929,22 +1984,6 @@ window.__ModuleLoader__.load({
           "div",
           { className: "pc-body" },
           error ? h("p", { className: "pc-error" }, error) : null,
-          /**
-           * 新旧构建错配的提示（本轮实测报障：面板点「导出」回
-           * `Unknown method: export.run`）。先说清原因与修法，别让用户对着原始报文猜。
-           */
-          staleHost
-            ? h(
-                "div",
-                { className: "pc-note-block", "data-stale-host": "1" },
-                h("p", null, STALE_HOST_TEXT),
-                h(
-                  "p",
-                  { className: "pc-field-hint" },
-                  `面板构建 ${BUILD}｜宿主构建 ${(status as any)?.build ?? "未上报（更旧的构建）"}`,
-                ),
-              )
-            : null,
           tab === "market"
             ? h(Market, {
                 call,

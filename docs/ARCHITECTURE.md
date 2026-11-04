@@ -469,3 +469,86 @@ op.import ──► 队列任务 "import" ──► 逐步 installBundle / setBu
 - 不修改 profile 的 `package.json` / `cordis.patch.yml` / `pnpm-lock.yaml`；文件路径只在确认后由 `dsh plugin` 或宿主服务改动。
 - 不写 `dsh-plugin-hub` 的版本信号文件（`gro.ngilp-hsd-versions.json`），本项目自持 `installed_cache`。
 - 不打印凭据、Cookie、令牌或完整认证响应。
+
+## Git 跨机器同步
+
+复用 `transfer.ts` 的只读导出、脱敏、`planImport` 与 `op.import`，Git 仅提供快照传输。
+固定分支 `harbor-sync`，固定路径模板 `harbor/environments/<validated-id>/snapshot.json`。
+`GitSync` 使用按 remote 哈希隔离的本地 bare mirror，不 checkout 远端文件；
+`read-tree` 保留远端原树，`update-index` 仅替换当前环境的普通 blob，`commit-tree` 不运行钩子。
+只 fetch 当前分支、不抓 tags；历史只显示当前环境最近 10 次 commit。
+快照稳定排序并将 exportedAt 设为 0，避免时间导致空提交；真实发布时间取 Git commit 时间。
+
+| 决策点 | 执行通道 | 原因与限制 |
+|---|---|---|
+| Git 检查、发布 | 系统 Git 子进程 | pluginManager 没有 Git 仓库服务；参数数组、无 shell，禁用交互，输出限 8MB，每命令 30 秒，可取消，操作串行 |
+| 缺失插件安装 | 现有 op.import → pluginManager 优先，CLI 兜底 | 沿用已验证的安装通道；CLI 仍走 resolveDshCommand，不新增裸 dsh spawn |
+| 启停与条目开关 | pluginManager，无子进程兜底 | CLI 无等价宿主语义，缺服务如实失败，application 仍由现有执行层解释 |
+| 配置恢复 | Git 同步经 configEditor 合并，缺服务/不支持项人工片段 | pluginManager 无任意 config 写接口；独立 configEditor 服务负责写入，不直接改 profile；插件数据文件不发布 |
+| 凭据与仓库认证 | 系统 Git 凭据管理器 / SSH agent | 不读取 Mnemon 私有状态，不自行保存 token；Git stderr 不返回或记录，防止认证信息泄漏 |
+
+RPC：sync.get/configure/preview/publish/apply/cancel。get 只读本地设置；configure 要确认且不出网。
+preview 才获取远端，保存仅服务端可生成的随机 token，绑定设置、本机快照、远端 commit 与内容，15 分钟有效。
+publish/apply 必须 confirm:true，并复核本机快照与设置；有安装队列任务时拒绝。
+publish 再取远端并比较预检 commit，普通 push 遇并发拒绝；不强推、不自动合并、不修改 Mnemon 分支。
+apply 使用预检的精确远端内容，经固定文件落点转入 op.import（服务端重算计划并逐个 validateSpec），
+不接受客户端提供的安装计划。取消/失败不声称撤销已完成的远端 push。
+同步设置损坏报错；远端不存在与网络失败分开处理，网络失败不当作空快照。
+版本与来源差异明确显示但不自动替换，远端删除不卸载。Git 历史不是安装事务回滚。
+本机配置与镜像在港湾自己的目录，导出不包含本插件自身数据。
+
+
+### 热重载后的构建握手刷新
+
+面板每 3 秒重新读取本地 `status`（无出网、无更新检查），请求串行并在卸载时清理定时器，
+避免热重载完成后仍保留初次加载的构建号。构建哈希只能判断不一致，不能推断哪端更旧；
+提示先建议刷新界面，再依据宿主能力执行热重载或重启。构建一致后自动撤下提示。
+
+
+### Git 同步中的本地开发插件保护
+
+`portableBundle` 用跨平台路径识别过滤本地路径与本地压缩包，同时排除其配置、条目与重复的未归属补丁，
+以插件名（不含源机器路径）写 omissions。入站遇目标机器同名本地插件时同样过滤，
+预检与执行使用同一过滤函数，避免 registry/git 安装覆盖开发路径或同步启停开发插件。
+`publicationBundle` 在开发机发布时保留远端已有的同名普通安装记录与配置，
+不将本地开发副本发布为第二个安装来源，也不因本地忽略而删除共享记录。
+手动文件导出/导入不受此策略影响。本地路径更新按钮禁用，版本结论仍为 unknown，
+已启用的开发插件可通过热重载加载用户已构建的代码。
+
+
+### Git 配置自动合并（宿主 ConfigEditor）
+
+本机 app.asar 中的 `@deepseek-ai/dsh-config-editor` 提供公开服务 `configEditor`：
+`entries()` 返回可配置的唯一 profile 条目；`edit(entry, change)` 在 HMR 串行区和 profile
+文件锁内重新读取配置、执行 schema 校验与原子写入，Loader reconcile 失败会还原。
+这是独立于 pluginManager 的宿主能力；前文仅 pluginManager 无配置接口的结论仍成立，
+但 Git 同步可以通过 ConfigEditor 自动处理支持的配置。港湾自身不改 profile 文件。
+
+| 决策点 | 执行通道 | 原因与限制 |
+|---|---|---|
+| Git 普通配置应用 | configEditor.entries/edit，无子进程兜底 | 宿主负责锁、校验、持久化与重载；CLI 无等价安全接口，缺服务退为可见人工项 |
+| 配置归属 | 唯一条目 id + 插件模块归属 + 可选 name 校验 | 不按相似名称猜测，不处理未激活或歧义条目，不执行 config 表达式 |
+| 配置并发 | 预检绑定本机 raw config 摘要，edit 回调内再比较 | 不向客户端或日志返回 raw config；配置变化要求重新确认 |
+| 应用顺序 | 现有安装/启停队列完成后，逐项调用宿主配置服务 | 安装未完成、需重启、取消或失败时不声称配置完成；新条目再次预检 |
+
+配置计划只含筛选后的普通 JSON patch、字段路径、跳过项和本机配置摘要。
+确认时再次计算并比较计划；任务只从服务端内部 map 获取配置计划，不接受客户端 patch。
+合并不删除本机额外字段；跳过凭据键、秘密取值、脱敏占位符、机器路径、原型键及表达式。
+数组含保护内容则整组保留；结构冲突和覆盖本机敏感复合值改为人工项。
+本地开发插件保护在配置计划之前执行。未支持行生成片段，成功自动合并行不再提示人工恢复。
+任务逐项汇报配置自动应用/待人工/保留/未应用，不传播宿主原始配置校验错误。
+
+
+构建提示策略更新：按用户要求移除界面/宿主构建差异提示及其 3 秒轮询；构建号仅保留为诊断信息。调用失败只展示实际错误，不附加构建提醒。
+
+
+### 补丁归属分类修正
+
+声明扫描递归遍历 insert 和显式 group:true 的 config 序列，深度上限 30；
+普通 config 数组不作为条目。补丁仅在恰有一个插件认领时归属，以行对象追踪已认领项，
+避免无 id 的已认领行重复进入 unattributed，也不以含糊 id 同时分配给多个插件。
+宿主内置识别表位于 core/patch-classification.ts，按本机 DSH app.asar 中
+base/web-app bundle 已核实的精确 id/module 对识别；不按 @deepseek-ai 前缀泛化。
+新增可选 profilePatch.builtin/unresolved 字段兼容 export v1；既有 unattributed 行读取时
+经 classifyExport 结合目标机器真实声明重新归属，旧文件保持只读，重复分类不重复记录。
+宿主配置与未知行继续脱敏保留，不作为自动恢复或删除指令。

@@ -1034,6 +1034,10 @@ test("更新完成后：队列回到空闲，已装页自动换成复查后的�
   assert.ok(installedReads > readsBefore, "队列由「有任务」回到空闲时必须重读已装清单");
   const installedText = text(tree);
   assert.match(installedText, /已最新/, "复查后应显示「已最新」");
+  const updateButton = findNode(tree, node => node.type === "button" && text(node) === "更新");
+  assert.equal(updateButton.props.disabled, true, "已最新时更新按钮必须禁用");
+  updateButton.props.onClick();
+  assert.ok(!findNode(harness.renderPanel(), node => node.props?.className === "pc-overlay"), "已最新时不应打开更新确认框");
   assert.match(installedText, /1\.9\.47/, "版本号要跟着更新");
 
   // 复查结论也写进了任务结论，在「操作」页能看到
@@ -1211,6 +1215,8 @@ test("导出 / 导入面板：导出要确认、预检先给计划、导入再�
             settings: { changed: ["locale"] },
             configRows: 1,
             unattributedRows: 2,
+            builtinRows: 11,
+            unresolved: [{ id: "mystery", reason: "条目归属尚未确认，不自动删除" }],
             omissions: [],
             warnings: ["导出文件来自 profile「laptop」，本机是「desktop」：本地路径形态可能对不上"],
           },
@@ -1283,7 +1289,10 @@ test("导出 / 导入面板：导出要确认、预检先给计划、导入再�
   assert.match(planText, /dsh-new：将安装 ← dsh-new@1\.0\.3/);
   assert.match(planText, /dsh-local：无法处理（目标机器上没有这个路径）/);
   assert.match(planText, /本插件自己的设置会被覆盖：locale/);
-  assert.match(planText, /另有 2 行补丁没归到已装插件/);
+  assert.match(planText, /另有 2 行补丁归属尚未确认/);
+  assert.match(planText, /11 行宿主内置配置/);
+  assert.match(planText, /mystery：条目归属尚未确认/);
+  assert.doesNotMatch(planText, /已原样带在导出文件里/);
   assert.match(planText, /1 行带 config 的补丁行/);
   assert.match(planText, /自行粘贴/);
   assert.equal(calls.length, 2, "预检不得下发任何变更");
@@ -1442,36 +1451,7 @@ test("导入：选错文件时如实报错，不留半截状态", async () => {
   );
 });
 
-test("宿主是旧构建时：面板先说清原因与修法，而不是抛 Unknown method", async () => {
-  // 1) 构建一致：不该出现过时的提示条
-  const fresh = createHarness(
-    defaultHandler(makeRows(3), []),
-    undefined,
-    null,
-  );
-  fresh.renderPanel();
-  await tick();
-  assert.ok(
-    !findNode(fresh.renderPanel(), (node) => node.props?.["data-stale-host"] === "1"),
-    "构建一致时不该提示宿主过旧",
-  );
-
-  // 2) 宿主不上报 build（更旧的构建）：提示条 + 两个构建号都写出来
-  const stale = createHarness(async (method) =>
-    method === "status" ? { ok: true, value: { ...statusPayload, build: "old-build" } } : { ok: false, error: { message: "x" } },
-  );
-  stale.renderPanel();
-  await tick();
-  const banner = findNode(stale.renderPanel(), (node) => node.props?.["data-stale-host"] === "1");
-  assert.ok(banner, "宿主构建与面板不一致时必须提示");
-  assert.match(text(banner), /宿主里运行的插件还是旧构建/);
-  assert.match(text(banner), /重启 DSH/);
-  assert.match(text(banner), /profile 重新组合/);
-  assert.match(text(banner), new RegExp(`面板构建 ${stale.build}`));
-  assert.match(text(banner), /宿主构建 old-build/);
-});
-
-test("调用不存在的方法时：把 Unknown method 翻成可照做的提示", async () => {
+test("调用不存在的方法时：仅显示实际错误，不追加构建提示", async () => {
   const harness = createHarness(async (method) => {
     if (method === "op.list")
       return { ok: true, value: { active: null, tasks: [], history: [] } };
@@ -1504,7 +1484,7 @@ test("调用不存在的方法时：把 Unknown method 翻成可照做的提示"
   ).props.onClick();
   await tick();
   const shown = text(harness.renderPanel());
-  assert.match(shown, /宿主里运行的插件还是旧构建/);
+  assert.doesNotMatch(shown, /插件构建不一致|热重载后会自动重新核对/);
   assert.match(shown, /Unknown method: export\.run/, "原始报文要留一份便于排查");
 });
 
@@ -1791,4 +1771,69 @@ test("does not use APIs the host GUI does not implement", () => {
    * 而 `window.open` 在新版浏览器里容易被弹窗拦截，还拿不到同等的 rel 保护。
    */
   assert.doesNotMatch(source, /\bwindow\.open\s*\(/);
+});
+test("Git sync panel stays local until requested and confirms publishing/applying", async () => {
+  const calls = [];
+  const config = { remote: "git@github.com:you/shared.git", environment: "desktop" };
+  const harness = createHarness(async (method, payload) => {
+    if (method.startsWith("sync.")) calls.push({ method, payload });
+    if (method === "sync.get") return { ok: true, value: { config, branch: "harbor-sync" } };
+    if (method === "sync.preview") return { ok: true, value: {
+      configPlans: [{ plugin: "example", id: "example", action: "apply", paths: ["theme"], skipped: ["token"] }],
+      token: "server-token", commit: "abc123", hasRemote: true, same: false, history: ["abc123 2026-11-04"], versions: ["example：安装来源或版本不同，首版保留本机版本"],
+      local: { plugins: [{ name: "example", enabled: true }], configRows: 1, snapshot: '{"config":"[已脱敏]"}', omissions: [], warnings: [] },
+      plan: { steps: [{ name: "example", action: "install", spec: "example@1.0.0" }], settings: { changed: [] }, configRows: 1, omissions: [], warnings: [] },
+      snippet: "# 人工恢复配置",
+    } };
+    if (method === "sync.publish") return { ok: true, value: { commit: "def456", unchanged: false } };
+    if (method === "sync.apply") return { ok: true, value: { id: "sync-op" } };
+    return await defaultHandler(makeRows(2), [])(method, payload);
+  });
+  const click = (label) => findNode(harness.renderPanel(), n => n.type === "button" && text(n) === label).props.onClick();
+  harness.renderPanel(); await tick(); click("已装"); click("导出 / 导入"); harness.renderPanel(); await tick();
+  assert.deepEqual(calls.map(c => c.method), ["sync.get"], "打开同步面板不查询远端");
+  click("检查远端并预检"); await tick();
+  assert.match(text(harness.renderPanel()), /首版保留本机版本/);
+  assert.match(text(harness.renderPanel()), /自动合并 theme/);
+  assert.doesNotMatch(text(harness.renderPanel()), /需人工恢复的配置片段|未自动应用的配置（查看原因与片段）/, "只有自动配置计划时，不显示人工片段，即使旧数据残留 snippet");
+  click("发布本机快照");
+  assert.equal(calls.filter(c => c.method === "sync.publish").length, 0);
+  click("取消");
+  assert.equal(calls.filter(c => c.method === "sync.publish").length, 0);
+  click("发布本机快照"); click("确认"); await tick();
+  assert.deepEqual(plain(calls.find(c => c.method === "sync.publish").payload), { token: "server-token", confirm: true });
+  click("检查远端并预检"); await tick(); click("应用远端快照");
+  assert.equal(calls.filter(c => c.method === "sync.apply").length, 0);
+  click("确认"); await tick();
+  assert.deepEqual(plain(calls.find(c => c.method === "sync.apply").payload), { token: "server-token", confirm: true });
+});
+
+
+test("构建不同也不显示提示，空闲时不轮询宿主构建号", async () => {
+  const calls = [];
+  const harness = createHarness(async (method, payload) => {
+    calls.push(method);
+    if (method === "status") return { ok: true, value: { ...statusPayload, build: "different-build" } };
+    return await defaultHandler(makeRows(2), [])(method, payload);
+  });
+  harness.renderPanel(); await tick();
+  harness.runIntervals(); await tick();
+  const tree = harness.renderPanel();
+  assert.ok(!findNode(tree, node => node.props?.["data-stale-host"] === "1"));
+  assert.doesNotMatch(text(tree), /插件构建不一致|热重载后会自动重新核对/);
+  assert.equal(calls.filter(method => method === "status").length, 1);
+});
+
+test("本地开发插件不提供远端更新，保留热重载入口", async () => {
+  const harness = createHarness(defaultHandler(makeRows(2), [{ name: "dev-plugin", kind: "path", spec: "link:../dev-plugin", selected: true, version: "1.0.0", update: { updateAvailable: null } }]));
+  harness.renderPanel(); await tick();
+  findNode(harness.renderPanel(), n => n.type === "button" && text(n) === "已装").props.onClick();
+  const row = findNode(harness.renderPanel(), n => n.props?.["data-plugin"] === "dev-plugin");
+  const update = findNode(row, n => n.type === "button" && text(n) === "更新");
+  assert.equal(update.props.disabled, true);
+  assert.match(update.props.title, /本地路径插件/);
+  assert.ok(findNode(row, n => n.type === "button" && text(n) === "热重载"));
+  update.props.onClick();
+  assert.ok(!findNode(harness.renderPanel(), n => n.props?.className === "pc-overlay"));
+  assert.match(text(row), /未判定/);
 });

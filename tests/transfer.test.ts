@@ -207,7 +207,7 @@ test("导出：清单、条目、归属到插件的配置行都带上", () => {
       bundle.profilePatch!.unattributed.map((row) => row.id),
       ["someone-else", "tagged"],
     );
-    assert.match(bundle.warnings.join("\n"), /2 行补丁没归到导出范围内的已装插件/);
+    assert.match(bundle.warnings.join("\n"), /2 行补丁归属尚未确认/);
   } finally {
     cleanup();
   }
@@ -546,4 +546,36 @@ test("脱敏：键名与取值两条路径都覆盖", () => {
   assert.ok(nested.count >= 4);
   assert.equal(redactText("plain text").count, 0);
   assert.match(redactText("https://user:pass@example.com/x").text, /\[已脱敏\]/);
+});
+test("嵌套分组归属、内置配置分类与旧快照兼容，不猜测未知条目", async () => {
+  const { classifyExport } = await import("../src/core/transfer.ts");
+  const { profile, cleanup } = fixture();
+  try {
+    writeFileSync(join(profile, "node_modules/dsh-channel-hub/cordis.patch.yml"), '- insert:\n  - id: hub-group\n    group: true\n    config:\n    - id: hub-child-group\n      group: true\n      config:\n      - id: hub-nested\n        name: dsh-channel-hub/nested\n  - id: channel-hub\n    name: dsh-channel-hub\n    config:\n    - id: ordinary-config-not-an-entry\n');
+    const ids = declaredRowIds(profile, "dsh-channel-hub");
+    assert.ok(ids.includes("hub-nested"));
+    assert.ok(!ids.includes("ordinary-config-not-an-entry"), "普通配置数组不能误认成条目声明");
+    writeFileSync(join(profile, "cordis.patch.yml"), '- id: hub-nested\n  disabled: true\n- id: ui-theme\n  name: "@deepseek-ai/dsh-client-ui-theme"\n  config:\n    theme: dark\n    token: sk-live-abcdefghijklmnopqrst\n- id: mystery\n  disabled: true\n- id: ui-chat\n  name: third-party-not-host\n  config:\n    enabled: true\n');
+    const b = buildExport({ profileName: "desktop", profileDir: profile, pluginVersion: "test", plugins: pluginsOf(), settings,
+      entries: [{ entryId: "include:hub-nested", moduleName: "dsh-channel-hub/nested", enabled: false }] });
+    assert.ok(b.plugins.find(p => p.name === "dsh-channel-hub")!.config!.some(r => r.id === "hub-nested"));
+    assert.equal(b.profilePatch!.builtin!.length, 1);
+    assert.equal((b.profilePatch!.builtin![0]!.config as any).token, "[已脱敏]");
+    assert.deepEqual(b.profilePatch!.unattributed.map(r => r.id), ["mystery", "ui-chat"]);
+    assert.ok(b.profilePatch!.unresolved!.every(r => r.reason));
+    const old: ExportBundle = structuredClone(b);
+    const nested = old.plugins.find(p => p.name === "dsh-channel-hub")!.config!.pop()!;
+    old.profilePatch!.unattributed.push(nested, ...old.profilePatch!.builtin!);
+    delete old.profilePatch!.builtin; delete old.profilePatch!.unresolved;
+    old.warnings = ["有 4 行补丁没归到导出范围内的已装插件，已原样放在 profilePatch.unattributed 里"];
+    const fixed = classifyExport(old, profile);
+    assert.equal(fixed.profilePatch!.builtin!.length, 1);
+    assert.deepEqual(fixed.profilePatch!.unattributed.map(r => r.id), ["mystery", "ui-chat"]);
+    assert.equal(classifyExport(fixed, profile).plugins.find(p => p.name === "dsh-channel-hub")!.config!.length, fixed.plugins.find(p => p.name === "dsh-channel-hub")!.config!.length, "重复分类不重复配置");
+    assert.match(fixed.warnings[0]!, /2 行补丁归属尚未确认/);
+    assert.equal(old.profilePatch!.unattributed.length, 4, "旧文件内容不被修改");
+    const plan = planImport({ source: "old.json", bundle: old, profileName: "desktop", profileDir: profile, installed: pluginsOf(), settings });
+    assert.equal(plan.builtinRows, 1); assert.equal(plan.unattributedRows, 2);
+    assert.equal(plan.unresolved!.length, 2);
+  } finally { cleanup(); }
 });

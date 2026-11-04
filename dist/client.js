@@ -12,8 +12,7 @@
       const { useCallback, useEffect, useRef, useState } = React;
       const PANEL_ID = "plugin-harbor";
       const LABEL = "\u63D2\u4EF6\u6E2F\u6E7E";
-      const BUILD = true ? "11e857d03cf4" : "dev";
-      const STALE_HOST_TEXT = "\u5BBF\u4E3B\u91CC\u8FD0\u884C\u7684\u63D2\u4EF6\u8FD8\u662F\u65E7\u6784\u5EFA\uFF1A\u754C\u9762\u5DF2\u7ECF\u4ECE\u78C1\u76D8\u52A0\u8F7D\u4E86\u65B0\u7248\u672C\uFF0C\u5BBF\u4E3B\u4FA7\u8981\u7B49\u91CD\u542F DSH\uFF0C\u6216\u5BF9\u4EFB\u610F\u53E6\u4E00\u4E2A\u63D2\u4EF6\u505A\u4E00\u6B21\u542F\u7528 / \u505C\u7528 / \u66F4\u65B0\uFF08\u4EFB\u4F55\u4E00\u6B21 profile \u91CD\u65B0\u7EC4\u5408\u90FD\u4F1A\u628A\u78C1\u76D8\u4E0A\u5DF2\u53D8\u5316\u7684\u63D2\u4EF6\u4EE3\u7801\u6362\u8FDB\u6765\uFF09\u3002";
+      const BUILD = true ? "9c9f05e7a601" : "dev";
       globalThis.__PLUGIN_HARBOR_BUILD__ = BUILD;
       const TABS = [
         { id: "market", label: "\u5E02\u573A" },
@@ -657,6 +656,7 @@
             h("span", { className: "pc-summary-inline" }, `\u5DF2\u88C5 ${rows.length} \u4E2A\u63D2\u4EF6`)
           ),
           transfer ? h(Transfer, { call, onDone: onReload }) : null,
+          transfer ? h(GitSyncPanel, { call, onDone: onReload }) : null,
           h(
             "div",
             { className: "pc-summary" },
@@ -951,6 +951,123 @@
           error ? h("p", { className: "pc-error" }, error) : null
         );
       }
+      function GitSyncPanel({ call, onDone }) {
+        const [remote, setRemote] = useState("");
+        const [environment, setEnvironment] = useState("default");
+        const [saved, setSaved] = useState("");
+        const [preview, setPreview] = useState(null);
+        const [busy, setBusy] = useState(false);
+        const [message, setMessage] = useState("");
+        const [error, setError] = useState("");
+        const [dialog, setDialog] = useState(null);
+        useEffect(() => {
+          let active = true;
+          call("sync.get").then((r) => {
+            if (!active || !r.config) return;
+            setRemote(r.config.remote);
+            setEnvironment(r.config.environment);
+            setSaved(JSON.stringify(r.config));
+          }).catch((e) => {
+            if (active) setError(String(e.message ?? e));
+          });
+          return () => {
+            active = false;
+          };
+        }, [call]);
+        const run = async (method, payload = {}) => {
+          setBusy(true);
+          setError("");
+          setMessage("");
+          try {
+            const result = await call(method, payload);
+            if (method === "sync.configure") {
+              setSaved(JSON.stringify(result.config));
+              setPreview(null);
+              setMessage("\u8BBE\u7F6E\u5DF2\u4FDD\u5B58\uFF0C\u5C1A\u672A\u8054\u7F51");
+            }
+            if (method === "sync.preview") setPreview(result);
+            if (method === "sync.publish") {
+              setPreview(null);
+              setMessage(result.unchanged ? "\u8FDC\u7AEF\u5185\u5BB9\u5DF2\u4E00\u81F4\uFF0C\u65E0\u9700\u65B0\u63D0\u4EA4" : `\u5FEB\u7167\u5DF2\u53D1\u5E03\uFF1A${result.commit}`);
+            }
+            if (method === "sync.apply") {
+              setPreview(null);
+              setMessage("\u5DF2\u52A0\u5165\u64CD\u4F5C\u961F\u5217\uFF1B\u666E\u901A\u914D\u7F6E\u5C06\u7531\u5BBF\u4E3B\u81EA\u52A8\u5408\u5E76\uFF0C\u9010\u9879\u7ED3\u679C\u8BF7\u67E5\u770B\u64CD\u4F5C\u9875");
+              await onDone?.();
+            }
+          } catch (e) {
+            setError(String(e.message ?? e));
+          } finally {
+            setBusy(false);
+          }
+        };
+        const matches = saved === JSON.stringify({ remote, environment });
+        const button = (label, action, disabled = false) => h("button", { type: "button", className: "pc-btn", disabled: busy || disabled, onClick: action }, label);
+        return h(
+          "section",
+          { className: "pc-card", "data-git-sync": "1" },
+          cardHead("Git \u8DE8\u673A\u5668\u540C\u6B65", "\u53EF\u4E0E Mnemon \u5171\u7528\u4ED3\u5E93\uFF1B\u4F7F\u7528\u72EC\u7ACB harbor-sync \u5206\u652F\u3002\u6253\u5F00\u9762\u677F\u4E0D\u8054\u7F51\u3002"),
+          h("label", { className: "pc-field" }, "\u4ED3\u5E93\u5730\u5740", h("input", { className: "pc-input", value: remote, disabled: busy, placeholder: "https://github.com/you/private-backup.git", onChange: (e) => {
+            setRemote(e.target.value);
+            setPreview(null);
+          } })),
+          h("label", { className: "pc-field" }, "\u5171\u4EAB\u73AF\u5883\u540D", h("input", { className: "pc-input", value: environment, disabled: busy, onChange: (e) => {
+            setEnvironment(e.target.value);
+            setPreview(null);
+          } })),
+          h("p", { className: "pc-field-hint" }, "\u4E0D\u540C\u673A\u5668\u586B\u5199\u76F8\u540C\u4ED3\u5E93\u4E0E\u73AF\u5883\u540D\u3002\u4F7F\u7528\u7CFB\u7EDF Git \u7684 SSH \u6216\u51ED\u636E\u7BA1\u7406\u5668\uFF1B\u5EFA\u8BAE\u4F7F\u7528\u79C1\u6709\u4ED3\u5E93\u3002\u914D\u7F6E\u8131\u654F\u540E\u53D1\u5E03\uFF0C\u51ED\u636E\u9700\u5728\u76EE\u6807\u673A\u5668\u5355\u72EC\u586B\u5199\u3002"),
+          h(
+            "div",
+            { className: "pc-form-footer is-inline" },
+            button("\u4FDD\u5B58\u8BBE\u7F6E", () => setDialog({ title: "\u4FDD\u5B58 Git \u540C\u6B65\u8BBE\u7F6E", body: "\u4EC5\u4FDD\u5B58\u672C\u673A\u8BBE\u7F6E\uFF0C\u4E0D\u8054\u7F51\u3002", detail: `${remote}
+\u5206\u652F\uFF1Aharbor-sync
+\u73AF\u5883\uFF1A${environment}`, action: () => run("sync.configure", { remote, environment, confirm: true }) })),
+            button("\u68C0\u67E5\u8FDC\u7AEF\u5E76\u9884\u68C0", () => run("sync.preview"), !matches),
+            busy ? h("button", { type: "button", className: "pc-btn", onClick: () => call("sync.cancel").catch(() => {
+            }) }, "\u53D6\u6D88 Git \u64CD\u4F5C") : null
+          ),
+          preview && matches ? h(
+            "div",
+            { className: "pc-note-block" },
+            h("p", null, preview.hasRemote ? `\u8FDC\u7AEF\u5FEB\u7167\uFF1A${preview.commit}\uFF1B${preview.same ? "\u5185\u5BB9\u4E00\u81F4" : "\u5B58\u5728\u5DEE\u5F02"}` : "\u8FDC\u7AEF\u5C1A\u65E0\u6B64\u73AF\u5883\u5FEB\u7167\uFF0C\u53EF\u53D1\u5E03\u672C\u673A\u73AF\u5883"),
+            h(
+              "details",
+              null,
+              h("summary", null, `\u672C\u673A\u5F85\u53D1\u5E03\uFF1A${preview.local.plugins.length} \u4E2A\u63D2\u4EF6\uFF0C${preview.local.configRows} \u884C\u914D\u7F6E`),
+              h("pre", { className: "pc-op-log" }, preview.local.plugins.map((p) => `${p.name} ${p.version ?? "\u7248\u672C\u672A\u77E5"} ${p.enabled ? "\u542F\u7528" : "\u505C\u7528"}`).join("\n")),
+              h("details", null, h("summary", null, "\u5B8C\u6574\u5F85\u53D1\u5E03\u5FEB\u7167\uFF08\u542B\u8131\u654F\u914D\u7F6E\uFF09"), h("pre", { className: "pc-op-log" }, preview.local.snapshot)),
+              h("p", null, "\u672A\u5BFC\u51FA\u9879\uFF1A"),
+              ...preview.local.omissions.map((x, i) => h("p", { key: i }, `${x.path}\uFF1A${x.reason}`)),
+              ...preview.local.warnings.map((x, i) => h("p", { key: "w" + i }, x))
+            ),
+            preview.plan ? h(PlanView, { plan: preview.plan }) : null,
+            ...preview.versions.map((x, i) => h("p", { key: i }, x)),
+            ...(preview.configPlans ?? []).map((p, i) => h(
+              "p",
+              { key: "config" + i, className: "pc-field-hint" },
+              `${p.plugin} / ${p.id || "\u65E0\u6761\u76EE ID"}\uFF1A${p.action === "apply" ? "\u81EA\u52A8\u5408\u5E76 " + p.paths.join("\u3001") : p.action === "skip" ? "\u4FDD\u7559\u672C\u673A\u914D\u7F6E" : "\u9700\u4EBA\u5DE5\u5904\u7406"}${p.reason ? "\uFF08" + p.reason + "\uFF09" : ""}${p.skipped.length ? "\uFF1B\u51ED\u636E\u3001\u8DEF\u5F84\u7B49\u53D7\u4FDD\u62A4\u5B57\u6BB5\u5DF2\u8DF3\u8FC7 " + p.skipped.length + " \u9879" : ""}`
+            )),
+            preview.snippet && preview.configPlans?.some((p) => p.action === "manual") ? h(
+              "details",
+              null,
+              h("summary", null, "\u672A\u81EA\u52A8\u5E94\u7528\u7684\u914D\u7F6E\uFF08\u67E5\u770B\u539F\u56E0\u4E0E\u7247\u6BB5\uFF09"),
+              ...preview.configPlans.filter((p) => p.action === "manual").map((p, i) => h("p", { key: i }, `${p.plugin} / ${p.id || "\u65E0\u6761\u76EE ID"}\uFF1A${p.reason || "\u65E0\u6CD5\u5B89\u5168\u81EA\u52A8\u5E94\u7528"}`)),
+              h("pre", { className: "pc-op-log" }, preview.snippet)
+            ) : null,
+            preview.snippet && !Array.isArray(preview.configPlans) ? h("p", { className: "pc-field-hint" }, "\u5F53\u524D\u8FD0\u884C\u7684\u670D\u52A1\u7AEF\u5C1A\u672A\u8FD4\u56DE\u81EA\u52A8\u914D\u7F6E\u8BA1\u5212\uFF0C\u672C\u6B21\u9884\u68C0\u65E0\u6CD5\u786E\u8BA4\u81EA\u52A8\u5E94\u7528\u80FD\u529B\u3002") : null,
+            h("p", { className: "pc-field-hint" }, "\u53D1\u5E03\u4F1A\u66FF\u6362\u8FDC\u7AEF\u6B64\u73AF\u5883\u7684\u5FEB\u7167\uFF0C\u8BF7\u5148\u6838\u5BF9\u8FDC\u7AEF\u5DEE\u5F02\uFF1B\u5E94\u7528\u4F1A\u5B89\u88C5\u7F3A\u5931\u63D2\u4EF6\u3001\u6062\u590D\u542F\u505C\u5E76\u901A\u8FC7\u5BBF\u4E3B\u5408\u5E76\u666E\u901A\u914D\u7F6E\uFF1B\u4FDD\u7559\u672C\u673A\u51ED\u636E\u4E0E\u8DEF\u5F84\uFF0C\u4E0D\u81EA\u52A8\u53D8\u66F4\u5DF2\u6709\u7248\u672C\u3002"),
+            button("\u53D1\u5E03\u672C\u673A\u5FEB\u7167", () => setDialog({ title: "\u53D1\u5E03\u672C\u673A\u73AF\u5883\u5FEB\u7167", body: "\u786E\u8BA4\u5C06\u9884\u68C0\u65F6\u7684\u672C\u673A\u5FEB\u7167\u5199\u5165\u8FDC\u7AEF\u6B64\u73AF\u5883\u76EE\u5F55\uFF1F\u8FDC\u7AEF\u5E76\u53D1\u53D8\u5316\u4F1A\u963B\u6B62\u53D1\u5E03\u3002", detail: `${remote}
+${environment} \xB7 ${preview.local.plugins.length} \u4E2A\u63D2\u4EF6 \xB7 ${preview.local.configRows} \u884C\u8131\u654F\u914D\u7F6E`, action: () => run("sync.publish", { token: preview.token, confirm: true }) })),
+            preview.hasRemote ? button("\u5E94\u7528\u8FDC\u7AEF\u5FEB\u7167", () => setDialog({ title: "\u5E94\u7528\u8FDC\u7AEF\u73AF\u5883", body: "\u786E\u8BA4\u6267\u884C\u4E0A\u65B9\u5B89\u88C5\u3001\u542F\u505C\u4E0E\u914D\u7F6E\u5408\u5E76\u8BA1\u5212\uFF1F\u51ED\u636E\u3001\u8DEF\u5F84\u7B49\u53D7\u4FDD\u62A4\u5B57\u6BB5\u4FDD\u7559\u672C\u673A\u503C\uFF1B\u4E0D\u652F\u6301\u7684\u914D\u7F6E\u9700\u4EBA\u5DE5\u5904\u7406\u3002", detail: `commit\uFF1A${preview.commit}
+` + preview.plan.steps.map((s) => `${PLAN_LABELS[s.action] ?? s.action}\uFF1A${s.name}`).join("\n"), action: () => run("sync.apply", { token: preview.token, confirm: true }) })) : null,
+            h("details", null, h("summary", null, "\u6B64\u73AF\u5883\u6700\u8FD1 10 \u6B21\u63D0\u4EA4"), h("pre", { className: "pc-op-log" }, preview.history.join("\n") || "\u6682\u65E0\u5386\u53F2"))
+          ) : null,
+          busy ? h("p", null, "\u6B63\u5728\u5904\u7406\u2026") : null,
+          message ? h("p", { role: "status" }, message) : null,
+          error ? h("p", { className: "pc-error", role: "alert" }, error) : null,
+          h(ConfirmDialog, { dialog, onClose: setDialog })
+        );
+      }
       const PLAN_LABELS = {
         install: "\u5C06\u5B89\u88C5",
         enable: "\u5C06\u542F\u7528",
@@ -980,10 +1097,12 @@
             { className: "pc-note" },
             `\u672C\u63D2\u4EF6\u81EA\u5DF1\u7684\u8BBE\u7F6E\u4F1A\u88AB\u8986\u76D6\uFF1A${plan.settings.changed.join("\u3001")}`
           ) : null,
+          plan.builtinRows > 0 ? h("p", { className: "pc-note" }, `\u53E6\u6709 ${plan.builtinRows} \u884C\u5BBF\u4E3B\u5185\u7F6E\u914D\u7F6E\uFF08\u5DF2\u8131\u654F\u4FDD\u7559\uFF0C\u4E0D\u53C2\u4E0E\u7B2C\u4E09\u65B9\u63D2\u4EF6\u81EA\u52A8\u6062\u590D\uFF09`) : null,
+          ...(plan.unresolved ?? []).map((row, i) => h("p", { key: "unresolved" + i, className: "pc-field-hint" }, `${row.id || "\u65E0\u6761\u76EE ID"}${row.name ? " \xB7 " + row.name : ""}\uFF1A${row.reason}`)),
           plan.unattributedRows > 0 ? h(
             "p",
             { className: "pc-note" },
-            `\u53E6\u6709 ${plan.unattributedRows} \u884C\u8865\u4E01\u6CA1\u5F52\u5230\u5DF2\u88C5\u63D2\u4EF6\uFF08\u5DF2\u539F\u6837\u5E26\u5728\u5BFC\u51FA\u6587\u4EF6\u91CC\uFF09`
+            `\u53E6\u6709 ${plan.unattributedRows} \u884C\u8865\u4E01\u5F52\u5C5E\u5C1A\u672A\u786E\u8BA4\uFF08\u5DF2\u8131\u654F\u4FDD\u7559\uFF0C\u4E0D\u81EA\u52A8\u5E94\u7528\u6216\u5220\u9664\uFF09`
           ) : null,
           (plan.warnings ?? []).map(
             (line) => h("p", { key: line, className: "pc-field-hint" }, "\xB7 " + line)
@@ -1039,14 +1158,17 @@
             h("span", null, "\u5F53\u524D " + (row.version ?? "\u2014")),
             h("span", null, "\u6700\u65B0 " + latest),
             typeof row.stars === "number" ? h("span", null, "\u2605 " + formatStars(row.stars)) : null,
-            // 变更动作：更新 / 卸载 / 启停。路径与压缩包装的插件没有远方版本可比，
-            // 「更新」按钮仍给出（它会原样重装），但徽标已如实标成「未判定」。
+            // 本地路径插件由用户更新源码并构建，通过热重载加载；不提供远端更新。
             h(
               "button",
               {
                 type: "button",
                 className: "pc-btn is-small",
-                onClick: () => onUpdate?.(row)
+                disabled: row.kind === "path" || verdict === false,
+                title: row.kind === "path" ? "\u672C\u5730\u8DEF\u5F84\u63D2\u4EF6\u8BF7\u5728\u6E90\u7801\u76EE\u5F55\u66F4\u65B0\u5E76\u6784\u5EFA\uFF1B\u5DF2\u542F\u7528\u65F6\u53EF\u4F7F\u7528\u70ED\u91CD\u8F7D" : verdict === false ? "\u5DF2\u662F\u6700\u65B0\u7248\u672C" : void 0,
+                onClick: () => {
+                  if (row.kind !== "path" && verdict !== false) onUpdate?.(row);
+                }
               },
               "\u66F4\u65B0"
             ),
@@ -1335,8 +1457,6 @@
           (method, payload = {}) => ctx.connection.rpc.call("/api", "plugin-harbor", { version: 1, method, payload }).then((result) => {
             if (result?.ok === false) {
               const message = String(result.error?.message ?? "\u8BF7\u6C42\u5931\u8D25");
-              if (/Unknown method/i.test(message))
-                throw Error(`${STALE_HOST_TEXT}\uFF08\u5BBF\u4E3B\u56DE\uFF1A${message}\uFF09`);
               throw Error(message);
             }
             return result.value ?? result;
@@ -1354,18 +1474,25 @@
         const [settings, setSettings] = useState(null);
         const [settingsError, setSettingsError] = useState("");
         const lastLive = useRef(-1);
-        const staleHost = status !== null && status?.build !== BUILD;
         useEffect(() => {
           let cancelled = false;
-          (async () => {
-            setError("");
+          let pending = false;
+          const refresh = async () => {
+            if (pending) return;
+            pending = true;
             try {
               const value = await call("status");
-              if (!cancelled) setStatus(value);
+              if (!cancelled) {
+                setStatus(value);
+                setError("");
+              }
             } catch (cause) {
               if (!cancelled) setError(String(cause?.message ?? cause));
+            } finally {
+              pending = false;
             }
-          })();
+          };
+          void refresh();
           return () => {
             cancelled = true;
           };
@@ -1539,20 +1666,6 @@
             "div",
             { className: "pc-body" },
             error ? h("p", { className: "pc-error" }, error) : null,
-            /**
-             * 新旧构建错配的提示（本轮实测报障：面板点「导出」回
-             * `Unknown method: export.run`）。先说清原因与修法，别让用户对着原始报文猜。
-             */
-            staleHost ? h(
-              "div",
-              { className: "pc-note-block", "data-stale-host": "1" },
-              h("p", null, STALE_HOST_TEXT),
-              h(
-                "p",
-                { className: "pc-field-hint" },
-                `\u9762\u677F\u6784\u5EFA ${BUILD}\uFF5C\u5BBF\u4E3B\u6784\u5EFA ${status?.build ?? "\u672A\u4E0A\u62A5\uFF08\u66F4\u65E7\u7684\u6784\u5EFA\uFF09"}`
-              )
-            ) : null,
             tab === "market" ? h(Market, {
               call,
               installedRepos,

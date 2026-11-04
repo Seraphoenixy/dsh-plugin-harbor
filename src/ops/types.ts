@@ -1,3 +1,4 @@
+import type { ConfigPlan } from "../git-sync/config.ts";
 /**
  * 操作层的公共类型。
  *
@@ -75,6 +76,8 @@ export interface OpTask {
   importSteps?: ImportTaskStep[];
   /** 导入文件里带的插件数（进度与结论用）。 */
   importCount?: number;
+  /** Git 同步专用：服务端确认后的脱敏配置计划。 */
+  importConfigPlans?: ConfigPlan[];
   /**
    * 导入时生成的「需要人工粘贴的配置片段」文件路径。
    *

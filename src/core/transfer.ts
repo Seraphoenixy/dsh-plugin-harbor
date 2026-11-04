@@ -1,3 +1,4 @@
+import { isBuiltinPatch, unresolvedPatchReason } from "./patch-classification.ts";
 /**
  * 已装插件与其配置的导出 / 导入。
  *
@@ -123,6 +124,9 @@ export interface ExportBundle {
     attributed: string[];
     /** 认不出属于谁的补丁行：原样带出，绝不丢。 */
     unattributed: ExportedConfigRow[];
+    /** 已核实的宿主内置配置，脱敏保留，不自动恢复宿主设置。 */
+    builtin?: ExportedConfigRow[];
+    unresolved?: { id?: string; name?: string; reason: string }[];
     error?: string;
   };
   /** 没进导出的东西及原因（数据库 / 二进制 / 过大 / 认不出归属 / 疑似凭据）。 */
@@ -160,15 +164,20 @@ export function buildExport(input: ExportInput): ExportBundle {
   const patch = readProfilePatch(input.profileDir);
   if (patch.error !== undefined) warnings.push(`profile 补丁未能解析：${patch.error}`);
   const unattributed: ExportedConfigRow[] = [];
+  const builtin: ExportedConfigRow[] = [];
+  const claimed = new Set<PatchRow>();
+  const declarations = new Map(input.plugins.map(p => [p.name, declaredRowIds(input.profileDir, p.name)]));
+  const owners = new Map(patch.rows.map(row => [row, input.plugins.filter(p => belongsTo(row, p.name, declarations.get(p.name)!)).map(p => p.name)]));
   const attributed: string[] = [];
   let redactions = 0;
 
   const plugins: ExportedPlugin[] = input.plugins.map((plugin) => {
-    const rowIds = declaredRowIds(input.profileDir, plugin.name);
-    const myEntries = (input.entries ?? []).filter((entry) => isEntryOf(entry.moduleName, plugin.name));
+    const rowIds = declarations.get(plugin.name)!;
+    const myEntries = (input.entries ?? []).filter((entry) => isEntryOf(entry.moduleName, plugin.name) || rowIds.includes(entry.entryId.replace(/^include:/, "")));
     const mine: ExportedConfigRow[] = [];
     for (const row of patch.rows) {
-      if (!belongsTo(row, plugin.name, rowIds)) continue;
+      if (owners.get(row)?.length !== 1 || owners.get(row)![0] !== plugin.name) continue;
+      claimed.add(row);
       if (row.id !== undefined) attributed.push(row.id);
       const safe = redactRow(row);
       redactions += safe.count;
@@ -201,15 +210,16 @@ export function buildExport(input: ExportInput): ExportBundle {
 
   // 归属不到的补丁行也要带出去：用户可能配置了导出范围之外的插件/宿主条目
   for (const row of patch.rows) {
-    if (row.id !== undefined && attributed.includes(row.id)) continue;
+    if (claimed.has(row)) continue;
     if (row.config === undefined && row.disabled === undefined) continue;
     const safe = redactRow(row);
     redactions += safe.count;
-    unattributed.push(safe.row);
+    if (isBuiltinPatch(row)) builtin.push(safe.row);
+    else unattributed.push(safe.row);
   }
   if (patch.rows.length > 0 && unattributed.length > 0)
     warnings.push(
-      `有 ${unattributed.length} 行补丁没归到导出范围内的已装插件（多半配置的是宿主自带条目或其他包），已原样放在 profilePatch.unattributed 里`,
+      `有 ${unattributed.length} 行补丁归属尚未确认，已脱敏保存在 profilePatch.unattributed；未自动应用或删除`,
     );
   if (input.includeData === true) {
     if (redactions > 0)
@@ -241,6 +251,8 @@ export function buildExport(input: ExportInput): ExportBundle {
     profilePatch: {
       attributed: [...new Set(attributed)],
       unattributed,
+      builtin,
+      unresolved: unattributed.map(row => ({ ...(row.id === undefined ? {} : { id: row.id }), ...(row.name === undefined ? {} : { name: row.name }), reason: unresolvedPatchReason(row) })),
       ...(patch.error === undefined ? {} : { error: patch.error }),
     },
     omissions,
@@ -248,6 +260,30 @@ export function buildExport(input: ExportInput): ExportBundle {
   };
   bundle.settings = redactSettings(input.settings);
   return bundle;
+}
+
+/** 兼容旧快照：按目标机器实际声明重新认领可确认条目，不改写源文件。 */
+export function classifyExport(bundle: ExportBundle, profileDir: string): ExportBundle {
+  const copy = structuredClone(bundle);
+  if (!copy.profilePatch) return copy;
+  const patch = copy.profilePatch;
+  const pending = patch.unattributed;
+  patch.unattributed = [];
+  patch.builtin ??= [];
+  const declarations = new Map(copy.plugins.map(p => [p.name, declaredRowIds(profileDir, p.name)]));
+  for (const row of pending) {
+    const owners = copy.plugins.filter(p => belongsTo(row, p.name, declarations.get(p.name)!));
+    if (owners.length === 1) {
+      const owner = owners[0]!;
+      (owner.config ??= []).push(row);
+      if (row.id && !patch.attributed.includes(row.id)) patch.attributed.push(row.id);
+    } else if (isBuiltinPatch(row)) patch.builtin.push(row);
+    else patch.unattributed.push(row);
+  }
+  patch.unresolved = patch.unattributed.map(row => ({ ...(row.id === undefined ? {} : { id: row.id }), ...(row.name === undefined ? {} : { name: row.name }), reason: unresolvedPatchReason(row) }));
+  copy.warnings = copy.warnings.filter(line => !(/^有 \d+ 行补丁/.test(line) && (line.includes("profilePatch.unattributed") || line.includes("归属尚未确认"))));
+  if (patch.unattributed.length) copy.warnings.push(`有 ${patch.unattributed.length} 行补丁归属尚未确认，已脱敏保存在 profilePatch.unattributed；未自动应用或删除`);
+  return copy;
 }
 
 /** 导出对象 → 可写盘的 JSON 文本（末尾带换行）。 */
@@ -313,6 +349,8 @@ export interface ImportPlan {
   /** 需要人工粘贴的配置行数。 */
   configRows: number;
   unattributedRows: number;
+  builtinRows?: number;
+  unresolved?: { id?: string; name?: string; reason: string }[];
   omissions: { path: string; reason: string }[];
   warnings: string[];
 }
@@ -331,18 +369,20 @@ export interface PlanInput {
 
 /** 预检：算出「将安装 / 将启用 / 将停用 / 条目开关 / 已一致 / 无法处理」。 */
 export function planImport(input: PlanInput): ImportPlan {
+  const bundle = classifyExport(input.bundle, input.profileDir);
   const exists = input.exists ?? existsSyncSafe;
   const byName = new Map(input.installed.map((plugin) => [plugin.name, plugin]));
   const entryByName = new Map<string, HostEntry[]>();
   for (const entry of input.entries ?? []) {
-    const owner = [...byName.keys()].find((name) => isEntryOf(entry.moduleName, name));
+    const candidates = [...byName.keys()].filter(name => isEntryOf(entry.moduleName, name) || declaredRowIds(input.profileDir, name).includes(entry.entryId.replace(/^include:/, "")));
+    const owner = candidates.length === 1 ? candidates[0] : undefined;
     if (owner === undefined) continue;
     const list = entryByName.get(owner) ?? [];
     list.push(entry);
     entryByName.set(owner, list);
   }
   const steps: ImportStep[] = [];
-  for (const exported of input.bundle.plugins) {
+  for (const exported of bundle.plugins) {
     const current = byName.get(exported.name);
     const kind = exported.kind;
     if (current === undefined) {
@@ -394,25 +434,27 @@ export function planImport(input: PlanInput): ImportPlan {
     });
   }
   const changed: string[] = [];
-  const exportedSettings = input.bundle.settings;
+  const exportedSettings = bundle.settings;
   if (exportedSettings !== undefined)
     for (const [key, value] of Object.entries(exportedSettings))
       if (JSON.stringify(input.settings?.[key as keyof CenterSettingsFile]) !== JSON.stringify(value))
         changed.push(key);
-  const warnings = [...(input.bundle.warnings ?? [])];
-  if (input.bundle.profile !== undefined && input.bundle.profile !== input.profileName)
+  const warnings = [...(bundle.warnings ?? [])];
+  if (bundle.profile !== undefined && bundle.profile !== input.profileName)
     warnings.push(
-      `导出文件来自 profile「${input.bundle.profile}」，本机是「${input.profileName}」：本地路径形态可能对不上`,
+      `导出文件来自 profile「${bundle.profile}」，本机是「${input.profileName}」：本地路径形态可能对不上`,
     );
   return {
     source: input.source,
-    ...(input.bundle.profile === undefined ? {} : { exportProfile: input.bundle.profile }),
-    ...(input.bundle.exportedAt === undefined ? {} : { exportedAt: input.bundle.exportedAt }),
+    ...(bundle.profile === undefined ? {} : { exportProfile: bundle.profile }),
+    ...(bundle.exportedAt === undefined ? {} : { exportedAt: bundle.exportedAt }),
     steps,
     settings: { changed },
-    configRows: input.bundle.plugins.reduce((sum, plugin) => sum + (plugin.config?.length ?? 0), 0),
-    unattributedRows: input.bundle.profilePatch?.unattributed?.length ?? 0,
-    omissions: input.bundle.omissions ?? [],
+    configRows: bundle.plugins.reduce((sum, plugin) => sum + (plugin.config?.length ?? 0), 0),
+    unattributedRows: (bundle.profilePatch?.unattributed ?? []).filter(row => !isBuiltinPatch(row)).length,
+    builtinRows: (bundle.profilePatch?.builtin?.length ?? 0) + (bundle.profilePatch?.unattributed ?? []).filter(isBuiltinPatch).length,
+    unresolved: (bundle.profilePatch?.unattributed ?? []).filter(row => !isBuiltinPatch(row)).map(row => ({ ...(row.id === undefined ? {} : { id: row.id }), ...(row.name === undefined ? {} : { name: row.name }), reason: unresolvedPatchReason(row) })),
+    omissions: bundle.omissions ?? [],
     warnings,
   };
 }
@@ -478,6 +520,12 @@ function serializeRow(row: ExportedConfigRow): string {
  *  - 本地路径 / link：**必须在目标机器上真实存在**，否则报阻塞 —— 让 pnpm 去猜一个别的
  *    机器上的路径只会得到一句看不懂的报错。
  */
+/** 与操作系统无关地识别源机器路径，不能在另一台机器猜相对路径归属。 */
+export function isLocalExport(plugin: ExportedPlugin): boolean {
+  return plugin.kind === "path" || /^(?:file|link):|^[A-Za-z]:[\\/]|^\\\\|^\/|^\.\.?[\\/]|^~[\\/]/.test(plugin.spec)
+    || (plugin.kind === "tarball" && !/^(?:https?:|git\+https?:)/i.test(plugin.spec));
+}
+
 export function installAddressFor(
   exported: ExportedPlugin,
   profileDir: string,
@@ -556,7 +604,7 @@ function readProfilePatch(profileDir: string): { rows: PatchRow[]; error?: strin
   let document: unknown;
   try {
     document = parseYaml(text, {
-      customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value: string) => value }],
+      customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value: string) => ({ __jsExpr: value }) }],
     });
   } catch (error) {
     return { rows: [], error: error instanceof Error ? error.message : String(error) };
@@ -585,6 +633,7 @@ function normalizeRow(row: Record<string, unknown>): PatchRow {
   if (typeof row.disabled === "boolean") out.disabled = row.disabled;
   // `!!js` 之类的表达式按字符串收下：转成布尔会改变语义（`!!js "ctx.get(...)"` 是求值时机问题）
   else if (typeof row.disabled === "string") out.disabled = row.disabled;
+  else if (row.disabled && typeof row.disabled === "object" && typeof (row.disabled as any).__jsExpr === "string") out.disabled = (row.disabled as any).__jsExpr;
   if (row.config !== undefined) out.config = row.config;
   if (row.insert !== undefined) out.insert = row.insert;
   return out;
@@ -614,15 +663,16 @@ export function declaredRowIds(profileDir: string, name: string): string[] {
     const document = parseYaml(text, {
       customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value: string) => value }],
     });
-    if (Array.isArray(document))
-      for (const item of document) {
-        if (!item || typeof item !== "object") continue;
-        const row = item as Record<string, unknown>;
-        const list = Array.isArray(row.insert) ? row.insert : [row];
-        for (const inner of list)
-          if (inner && typeof inner === "object" && typeof (inner as any).id === "string")
-            ids.push((inner as any).id);
-      }
+    const visit = (value: unknown, depth = 0) => {
+      if (depth > 30 || !value || typeof value !== "object") return;
+      if (Array.isArray(value)) { for (const row of value) visit(row, depth + 1); return; }
+      const row = value as Record<string, unknown>;
+      if (typeof row.id === "string") ids.push(row.id);
+      if (Array.isArray(row.insert)) visit(row.insert, depth + 1);
+      // 只有明确声明为 group 的 config 才是嵌套条目，普通插件配置绝不遍历。
+      if (row.group === true && Array.isArray(row.config)) visit(row.config, depth + 1);
+    };
+    visit(document);
   } catch {
     return [];
   }

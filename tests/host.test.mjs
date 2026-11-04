@@ -1267,3 +1267,90 @@ test(
     });
   },
 );
+
+test("real host: Git sync RPC binds confirmation and preview to local facts (offline bare remote)", { skip }, async () => {
+  const { execFileSync } = await import("node:child_process");
+  await withTempHome(async home => {
+    const { ctx, routes } = createHost();
+    const profileDir = writeProfile(home, {}, []);
+    const remote = join(home, "backup.git");
+    execFileSync("git", ["init", "--bare", remote], { stdio: "ignore", windowsHide: true });
+    let fiber;
+    try {
+      fiber = ctx.plugin(await import(`../dist/index.js?git-sync=${Date.now()}`));
+      while (fiber.inertia) await fiber.inertia;
+      const rpc = async (method, payload = {}) => (await callRoute(routes[0], envelope(method, payload))).json.result;
+      assert.equal((await rpc("sync.get")).value.config, null);
+      assert.equal((await rpc("sync.configure", { remote, environment: "desktop" })).ok, false);
+      assert.equal((await rpc("sync.configure", { remote, environment: "desktop", confirm: true })).ok, true);
+      const preview = await rpc("sync.preview"); assert.equal(preview.ok, true, JSON.stringify(preview));
+      assert.equal(preview.value.hasRemote, false);
+      assert.equal((await rpc("sync.publish", { token: preview.value.token })).ok, false);
+      const published = await rpc("sync.publish", { token: preview.value.token, confirm: true });
+      assert.equal(published.ok, true, JSON.stringify(published));
+      assert.equal((await rpc("sync.apply", { token: preview.value.token, confirm: true })).ok, false, "发布后旧 token 失效");
+      const again = await rpc("sync.preview"); assert.equal(again.value.hasRemote, true);
+      assert.equal((await rpc("sync.apply", { token: again.value.token })).ok, false);
+      // 本机事实变化使确认失效；只操作隔离夹具 profile。
+      writeFileSync(join(profileDir, "cordis.patch.yml"), '- id: example\n  config:\n    theme: dark\n');
+      const stale = await rpc("sync.apply", { token: again.value.token, confirm: true });
+      assert.equal(stale.ok, false); assert.match(stale.error.message, /已变化/);
+      const fresh = await rpc("sync.preview");
+      const applied = await rpc("sync.apply", { token: fresh.value.token, confirm: true });
+      assert.equal(applied.ok, true, JSON.stringify(applied));
+      assert.equal(applied.value.kind, "import");
+    } finally { await fiber?.dispose(); await ctx.stop?.(); }
+  });
+});
+
+test("real host: confirmed Git sync applies safe config through host editor and preserves local credentials", { skip }, async () => {
+  const { execFileSync } = await import("node:child_process");
+  await withTempHome(async home => {
+    const { ctx, routes } = createHost();
+    const profile = writeProfile(home, { "dsh-cost-meter": "1.9.28" }, ["dsh-cost-meter"]);
+    writeFileSync(join(profile, "cordis.patch.yml"), '- id: cost-meter\n  name: dsh-cost-meter\n  config:\n    theme: dark\n    token: source-credential\n    dataPath: D:/source\n');
+    class Manager extends host.Service {
+      constructor(c) { super(c, "pluginManager"); }
+      async listPlugins() { return []; }
+    }
+    new Manager(ctx);
+    const entry = { options: { id: "cost-meter", name: "dsh-cost-meter", config: { theme: "light", token: "target-credential", dataPath: "D:/target" } }, fiber: { state: 2 } };
+    let edits = 0;
+    class Editor extends host.Service {
+      constructor(c) { super(c, "configEditor"); }
+      entries() { return [entry]; }
+      async edit(target, change) { assert.equal(target, entry); edits++; entry.options.config = change(structuredClone(entry.options.config), {}); }
+    }
+    new Editor(ctx);
+    const remote = join(home, "config-backup.git"); execFileSync("git", ["init", "--bare", remote], { stdio: "ignore", windowsHide: true });
+    let fiber;
+    try {
+      fiber = ctx.plugin(await import(`../dist/index.js?sync-config=${Date.now()}`)); while (fiber.inertia) await fiber.inertia;
+      const rpc = async (method, payload = {}) => (await callRoute(routes[0], envelope(method, payload))).json.result;
+      await rpc("sync.configure", { remote, environment: "shared", confirm: true });
+      let preview = await rpc("sync.preview");
+      assert.equal((await rpc("sync.publish", { token: preview.value.token, confirm: true })).ok, true);
+      preview = await rpc("sync.preview");
+      assert.equal(preview.ok, true, JSON.stringify(preview));
+      assert.equal(preview.value.configPlans[0].action, "apply");
+      assert.deepEqual(preview.value.configPlans[0].paths, ["theme"]);
+      assert.equal(preview.value.snippet, undefined, "自动配置行不再要求人工片段");
+      assert.doesNotMatch(JSON.stringify(preview), /target-credential|source-credential/);
+      assert.equal((await rpc("sync.apply", { token: preview.value.token })).ok, false);
+      assert.equal(edits, 0);
+      const result = await rpc("sync.apply", { token: preview.value.token, confirm: true });
+      assert.equal(result.ok, true, JSON.stringify(result));
+      let task;
+      for (let i = 0; i < 50; i++) {
+        const listed = await rpc("op.list"); task = listed.value.tasks.find(t => t.id === result.value.id);
+        if (task && !["queued", "running"].includes(task.status)) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal(task.status, "done", JSON.stringify(task));
+      assert.match(task.note, /自动应用 1/);
+      assert.equal(edits, 1);
+      assert.deepEqual(entry.options.config, { theme: "dark", token: "target-credential", dataPath: "D:/target" });
+      assert.doesNotMatch(JSON.stringify(task), /target-credential|source-credential/);
+    } finally { await fiber?.dispose(); await ctx.stop?.(); }
+  });
+});

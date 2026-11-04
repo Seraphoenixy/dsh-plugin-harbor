@@ -1,7 +1,1217 @@
+// src/git-sync/config.ts
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+
+// src/core/patch-classification.ts
+var BUILTIN_PATCH_ROWS = {
+  "ui-settings-general": "@deepseek-ai/dsh-client-ui-settings-general",
+  "agent-default-model": "@deepseek-ai/dsh-agent-default-model",
+  permission: "@deepseek-ai/dsh-permission-presets",
+  "ui-theme": "@deepseek-ai/dsh-client-ui-theme",
+  "ui-chat": "@deepseek-ai/dsh-client-ui-chat",
+  "ui-settings": "@deepseek-ai/dsh-client-ui-settings",
+  "ui-settings-account": "@deepseek-ai/dsh-client-ui-settings-account",
+  "llm-deepseek": "@deepseek-ai/dsh-llm-deepseek-api-key",
+  "llm-pi-ai": "@deepseek-ai/dsh-llm-pi-ai",
+  "session-log-deepseek": "@deepseek-ai/dsh-session-log-deepseek",
+  "agent-preset-registry": "@deepseek-ai/dsh-agent-preset-registry"
+};
+function isBuiltinPatch(row) {
+  return !!row.id && !!row.name && Object.hasOwn(BUILTIN_PATCH_ROWS, row.id) && BUILTIN_PATCH_ROWS[row.id] === row.name;
+}
+function unresolvedPatchReason(row) {
+  return row.name ? "\u6A21\u5757\u672A\u5339\u914D\u5BFC\u51FA\u8303\u56F4\u5185\u5DF2\u88C5\u63D2\u4EF6\u7684\u58F0\u660E\uFF1B\u662F\u5426\u4ECD\u6709\u6548\u672A\u786E\u8BA4\uFF0C\u4E0D\u81EA\u52A8\u5E94\u7528\u6216\u5220\u9664" : "\u7F3A\u5C11\u6A21\u5757\u540D\uFF0C\u6761\u76EE ID \u672A\u552F\u4E00\u5339\u914D\u5F53\u524D\u5DF2\u88C5\u63D2\u4EF6\u58F0\u660E\uFF1B\u53EF\u80FD\u4E3A\u52A8\u6001\u6761\u76EE\u6216\u5386\u53F2\u914D\u7F6E\uFF0C\u4E0D\u80FD\u786E\u8BA4\u65E0\u7528";
+}
+
+// src/core/transfer.ts
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { basename, extname, join, resolve as resolve2 } from "node:path";
+import { parse as parseYaml } from "yaml";
+
+// src/ops/spec.ts
+import { homedir } from "node:os";
+import { isAbsolute, resolve } from "node:path";
+var LOCAL_PROTOCOL = /^(file|link):(.*)$/s;
+var NON_REGISTRY_VALUE = /^(?!(?:npm|jsr|workspace|catalog):)[a-z][a-z0-9+.-]*:|^[^@/:\s]+@[^:/\s]+:/i;
+var HTTP_USER_INFO = /^((?:git\+)?https?:\/\/)[^/]*@/i;
+function redactSpec(value) {
+  return value.replace(HTTP_USER_INFO, "$1");
+}
+function installSpecFor(source, profileDir, targetVersion) {
+  const name2 = source.name;
+  const recorded = (source.spec ?? "").trim();
+  const local = LOCAL_PROTOCOL.exec(recorded);
+  if (local) return withName(name2, `${local[1]}:${absoluteLocal(local[2], profileDir)}`, source.packageName);
+  if (recorded !== "" && NON_REGISTRY_VALUE.test(recorded))
+    return withName(name2, redactSpec(recorded), source.packageName);
+  if (source.kind === "path" || source.kind === "tarball") {
+    if (profileDir === void 0) return withName(name2, recorded, source.packageName);
+    const bare = recorded.replace(/^(file|link):/, "");
+    return withName(name2, `file:${absoluteLocal(bare, profileDir)}`, source.packageName);
+  }
+  const range = targetVersion !== void 0 && targetVersion !== "" ? targetVersion : recorded;
+  return `${name2}@${range === "" ? "latest" : range}`;
+}
+function latestSpec(kind, spec, name2, profileDir) {
+  const text2 = spec.trim();
+  if (kind === "registry") return `${name2}@latest`;
+  const looksRegistry = kind === void 0 && (/^(\^|~)?\d|^\*$|^latest$/i.test(text2) || text2 === "");
+  if (looksRegistry) return `${name2}@latest`;
+  if (kind === void 0 && text2 === "") return `${name2}@latest`;
+  return installSpecFor(
+    { name: name2, spec: text2, kind: kind === "git" || kind === "path" || kind === "tarball" ? kind : "unknown" },
+    profileDir
+  );
+}
+function absoluteLocal(path, profileDir) {
+  const expanded = path.replace(/^~(?=$|[\\/])/, () => homedir());
+  if (isAbsolute(expanded)) return expanded;
+  if (expanded.startsWith("~/") || expanded.startsWith("~\\")) return expanded;
+  return profileDir === void 0 ? expanded : resolve(profileDir, expanded);
+}
+function withName(name2, spec, packageName) {
+  const own = packageName ?? name2;
+  return own === name2 ? spec : `${name2}@${spec}`;
+}
+
+// src/core/transfer.ts
+var EXPORT_FORMAT = "dsh-plugin-harbor/export";
+var EXPORT_VERSION = 1;
+var MAX_FILE_BYTES = 256 * 1024;
+var MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+var MAX_DEPTH = 3;
+var TEXT_EXTENSIONS = /* @__PURE__ */ new Set([
+  ".json",
+  ".jsonc",
+  ".yml",
+  ".yaml",
+  ".txt",
+  ".md",
+  ".toml",
+  ".ini",
+  ".cfg",
+  ".conf"
+]);
+var EXCLUDED_DIRS = /* @__PURE__ */ new Set([
+  "node_modules",
+  "cache",
+  "caches",
+  ".git",
+  "exports",
+  "logs",
+  "log",
+  "tmp",
+  "temp"
+]);
+var EXCLUDED_FILE = /\.(sqlite3?|db|db3|log|lock|tgz|tar|gz|zip|bin|node|dll|exe|so|dylib)(-wal|-shm)?$/i;
+var SECRET_KEY = /(token|secret|passwd|password|apikey|accesskey|privatekey|credential|cookie|authorization|sessionid|clientsecret)/;
+var SECRET_VALUE = [
+  /\bsk-[A-Za-z0-9_-]{16,}/,
+  /\bgh[pousr]_[A-Za-z0-9]{16,}/,
+  /\bnpm_[A-Za-z0-9]{16,}/,
+  /\bBearer\s+\S+/i,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./,
+  /:\/\/[^/\s:@]+:[^/\s:@]+@/
+];
+var REDACTED = "[\u5DF2\u8131\u654F]";
+function buildExport(input) {
+  const now = input.now ?? Date.now();
+  const warnings = [];
+  const omissions = [];
+  const patch = readProfilePatch(input.profileDir);
+  if (patch.error !== void 0) warnings.push(`profile \u8865\u4E01\u672A\u80FD\u89E3\u6790\uFF1A${patch.error}`);
+  const unattributed = [];
+  const builtin = [];
+  const claimed = /* @__PURE__ */ new Set();
+  const declarations = new Map(input.plugins.map((p) => [p.name, declaredRowIds(input.profileDir, p.name)]));
+  const owners = new Map(patch.rows.map((row) => [row, input.plugins.filter((p) => belongsTo(row, p.name, declarations.get(p.name))).map((p) => p.name)]));
+  const attributed = [];
+  let redactions = 0;
+  const plugins = input.plugins.map((plugin) => {
+    const rowIds = declarations.get(plugin.name);
+    const myEntries = (input.entries ?? []).filter((entry) => isEntryOf(entry.moduleName, plugin.name) || rowIds.includes(entry.entryId.replace(/^include:/, "")));
+    const mine = [];
+    for (const row of patch.rows) {
+      if (owners.get(row)?.length !== 1 || owners.get(row)[0] !== plugin.name) continue;
+      claimed.add(row);
+      if (row.id !== void 0) attributed.push(row.id);
+      const safe = redactRow(row);
+      redactions += safe.count;
+      mine.push(safe.row);
+    }
+    const exported = {
+      name: plugin.name,
+      spec: plugin.spec,
+      kind: plugin.kind,
+      enabled: plugin.selected
+    };
+    if (plugin.version !== void 0) exported.version = plugin.version;
+    if (plugin.repo !== void 0) exported.repo = plugin.repo;
+    if (plugin.packageName !== void 0) exported.packageName = plugin.packageName;
+    if (input.entries !== void 0)
+      exported.entries = myEntries.map((entry) => ({
+        entryId: entry.entryId,
+        moduleName: entry.moduleName,
+        enabled: entry.enabled
+      }));
+    if (mine.length > 0) exported.config = mine;
+    if (input.includeData === true) {
+      const scan = collectDataFiles(input.profileDir, plugin, myEntries, input.selfDirName);
+      omissions.push(...scan.omissions);
+      redactions += scan.redactions;
+      if (scan.files.length > 0) exported.files = scan.files;
+    }
+    return exported;
+  });
+  for (const row of patch.rows) {
+    if (claimed.has(row)) continue;
+    if (row.config === void 0 && row.disabled === void 0) continue;
+    const safe = redactRow(row);
+    redactions += safe.count;
+    if (isBuiltinPatch(row)) builtin.push(safe.row);
+    else unattributed.push(safe.row);
+  }
+  if (patch.rows.length > 0 && unattributed.length > 0)
+    warnings.push(
+      `\u6709 ${unattributed.length} \u884C\u8865\u4E01\u5F52\u5C5E\u5C1A\u672A\u786E\u8BA4\uFF0C\u5DF2\u8131\u654F\u4FDD\u5B58\u5728 profilePatch.unattributed\uFF1B\u672A\u81EA\u52A8\u5E94\u7528\u6216\u5220\u9664`
+    );
+  if (input.includeData === true) {
+    if (redactions > 0)
+      warnings.push(`\u63D2\u4EF6\u8BBE\u7F6E\u91CC\u6709 ${redactions} \u5904\u7591\u4F3C\u51ED\u636E\u7684\u5B57\u6BB5/\u53D6\u503C\uFF0C\u5DF2\u66FF\u6362\u4E3A ${REDACTED}`);
+    warnings.push("\u63D2\u4EF6\u81EA\u5DF1\u7684\u8BBE\u7F6E\u6587\u4EF6\u53EA\u5BFC\u51FA\u3001\u4E0D\u81EA\u52A8\u5BFC\u5165\uFF1A\u90A3\u662F\u5404\u63D2\u4EF6\u81EA\u5DF1\u7684\u6570\u636E\uFF0C\u672C\u9879\u76EE\u4E0D\u4EE3\u5199");
+    const owned = ownedDataDirNames(
+      input.profileDir,
+      input.plugins,
+      input.entries ?? [],
+      input.selfDirName
+    );
+    for (const dir of unownedProfileDirs(input.profileDir, owned))
+      omissions.push({ path: dir, reason: "\u8BA4\u4E0D\u51FA\u5C5E\u4E8E\u54EA\u4E2A\u5DF2\u88C5\u63D2\u4EF6\uFF0C\u672A\u5BFC\u51FA\u5176\u5185\u5BB9" });
+  }
+  if (input.entries === void 0)
+    warnings.push("\u5BBF\u4E3B pluginManager \u670D\u52A1\u4E0D\u53EF\u7528\uFF1A\u672A\u5305\u542B\u6761\u76EE\u7EA7\u4FE1\u606F\uFF08\u6761\u76EE\u5F00\u5173\u65E0\u6CD5\u5BFC\u51FA/\u5BFC\u5165\uFF09");
+  const bundle = {
+    format: EXPORT_FORMAT,
+    version: EXPORT_VERSION,
+    exportedAt: now,
+    profile: input.profileName,
+    by: { plugin: "plugin-harbor", version: input.pluginVersion },
+    plugins,
+    profilePatch: {
+      attributed: [...new Set(attributed)],
+      unattributed,
+      builtin,
+      unresolved: unattributed.map((row) => ({ ...row.id === void 0 ? {} : { id: row.id }, ...row.name === void 0 ? {} : { name: row.name }, reason: unresolvedPatchReason(row) })),
+      ...patch.error === void 0 ? {} : { error: patch.error }
+    },
+    omissions,
+    warnings
+  };
+  bundle.settings = redactSettings(input.settings);
+  return bundle;
+}
+function classifyExport(bundle, profileDir) {
+  const copy = structuredClone(bundle);
+  if (!copy.profilePatch) return copy;
+  const patch = copy.profilePatch;
+  const pending = patch.unattributed;
+  patch.unattributed = [];
+  patch.builtin ??= [];
+  const declarations = new Map(copy.plugins.map((p) => [p.name, declaredRowIds(profileDir, p.name)]));
+  for (const row of pending) {
+    const owners = copy.plugins.filter((p) => belongsTo(row, p.name, declarations.get(p.name)));
+    if (owners.length === 1) {
+      const owner = owners[0];
+      (owner.config ??= []).push(row);
+      if (row.id && !patch.attributed.includes(row.id)) patch.attributed.push(row.id);
+    } else if (isBuiltinPatch(row)) patch.builtin.push(row);
+    else patch.unattributed.push(row);
+  }
+  patch.unresolved = patch.unattributed.map((row) => ({ ...row.id === void 0 ? {} : { id: row.id }, ...row.name === void 0 ? {} : { name: row.name }, reason: unresolvedPatchReason(row) }));
+  copy.warnings = copy.warnings.filter((line) => !(/^有 \d+ 行补丁/.test(line) && (line.includes("profilePatch.unattributed") || line.includes("\u5F52\u5C5E\u5C1A\u672A\u786E\u8BA4"))));
+  if (patch.unattributed.length) copy.warnings.push(`\u6709 ${patch.unattributed.length} \u884C\u8865\u4E01\u5F52\u5C5E\u5C1A\u672A\u786E\u8BA4\uFF0C\u5DF2\u8131\u654F\u4FDD\u5B58\u5728 profilePatch.unattributed\uFF1B\u672A\u81EA\u52A8\u5E94\u7528\u6216\u5220\u9664`);
+  return copy;
+}
+function serializeExport(bundle) {
+  return JSON.stringify(bundle, null, 2) + "\n";
+}
+function exportFileName(profileName, now) {
+  const stamp = new Date(now).toISOString().replace(/[:.]/g, "-").replace(/Z$/, "");
+  return `${stamp}-${profileName}.json`;
+}
+function readExport(text2) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text2);
+  } catch (error) {
+    return { error: "\u4E0D\u662F\u5408\u6CD5 JSON\uFF1A" + (error instanceof Error ? error.message : String(error)) };
+  }
+  if (!parsed || typeof parsed !== "object") return { error: "\u5185\u5BB9\u4E0D\u662F\u5BF9\u8C61" };
+  if (parsed.format !== EXPORT_FORMAT)
+    return { error: `\u4E0D\u662F\u63D2\u4EF6\u6E2F\u6E7E\u7684\u5BFC\u51FA\u6587\u4EF6\uFF08format=${String(parsed.format)}\uFF09` };
+  if (parsed.version !== EXPORT_VERSION)
+    return { error: `\u5BFC\u51FA\u683C\u5F0F\u7248\u672C\u4E0D\u652F\u6301\uFF1A${String(parsed.version)}\uFF08\u672C\u63D2\u4EF6\u652F\u6301 ${EXPORT_VERSION}\uFF09` };
+  if (!Array.isArray(parsed.plugins)) return { error: "\u7F3A\u5C11 plugins \u6570\u7EC4" };
+  for (const plugin of parsed.plugins) {
+    if (!plugin || typeof plugin.name !== "string" || plugin.name === "")
+      return { error: "plugins \u91CC\u6709\u6761\u76EE\u7F3A\u5C11 name" };
+    if (typeof plugin.spec !== "string") return { error: `\u63D2\u4EF6 ${plugin.name} \u7F3A\u5C11 spec` };
+    if (typeof plugin.kind !== "string") return { error: `\u63D2\u4EF6 ${plugin.name} \u7F3A\u5C11 kind` };
+  }
+  return { bundle: parsed };
+}
+function planImport(input) {
+  const bundle = classifyExport(input.bundle, input.profileDir);
+  const exists = input.exists ?? existsSyncSafe;
+  const byName = new Map(input.installed.map((plugin) => [plugin.name, plugin]));
+  const entryByName = /* @__PURE__ */ new Map();
+  for (const entry of input.entries ?? []) {
+    const candidates = [...byName.keys()].filter((name2) => isEntryOf(entry.moduleName, name2) || declaredRowIds(input.profileDir, name2).includes(entry.entryId.replace(/^include:/, "")));
+    const owner = candidates.length === 1 ? candidates[0] : void 0;
+    if (owner === void 0) continue;
+    const list2 = entryByName.get(owner) ?? [];
+    list2.push(entry);
+    entryByName.set(owner, list2);
+  }
+  const steps = [];
+  for (const exported of bundle.plugins) {
+    const current = byName.get(exported.name);
+    const kind = exported.kind;
+    if (current === void 0) {
+      const address = installAddressFor(exported, input.profileDir, exists);
+      if (address.blocked !== void 0) {
+        steps.push({ name: exported.name, action: "blocked", kind, reason: address.blocked });
+        continue;
+      }
+      steps.push({
+        name: exported.name,
+        action: "install",
+        spec: address.spec,
+        enabled: exported.enabled !== false,
+        kind
+      });
+      continue;
+    }
+    const wantEnabled = exported.enabled !== false;
+    if (wantEnabled !== current.selected) {
+      steps.push({ name: exported.name, action: wantEnabled ? "enable" : "disable", kind });
+      continue;
+    }
+    const wanted = (exported.entries ?? []).filter((entry) => entry.enabled !== void 0);
+    const live = entryByName.get(exported.name) ?? [];
+    const changes = input.entries === void 0 ? [] : wanted.map((entry) => {
+      const actual = live.find((row) => row.entryId === entry.entryId);
+      if (actual === void 0 || actual.readOnlyReason !== void 0) return void 0;
+      return actual.enabled === entry.enabled ? void 0 : { entryId: entry.entryId, enabled: entry.enabled };
+    }).filter((row) => row !== void 0);
+    if (changes.length > 0) {
+      steps.push({ name: exported.name, action: "entries", entries: changes, kind });
+      continue;
+    }
+    steps.push({
+      name: exported.name,
+      action: "skip",
+      kind,
+      reason: input.entries === void 0 ? "\u4F9D\u8D56\u4E0E\u542F\u7528\u72B6\u6001\u5DF2\u4E00\u81F4\uFF08\u5BBF\u4E3B\u670D\u52A1\u4E0D\u53EF\u7528\uFF0C\u672A\u6BD4\u5BF9\u6761\u76EE\u5F00\u5173\uFF09" : "\u4F9D\u8D56\u3001\u542F\u7528\u72B6\u6001\u4E0E\u6761\u76EE\u5F00\u5173\u90FD\u5DF2\u4E00\u81F4"
+    });
+  }
+  const changed = [];
+  const exportedSettings = bundle.settings;
+  if (exportedSettings !== void 0) {
+    for (const [key, value] of Object.entries(exportedSettings))
+      if (JSON.stringify(input.settings?.[key]) !== JSON.stringify(value))
+        changed.push(key);
+  }
+  const warnings = [...bundle.warnings ?? []];
+  if (bundle.profile !== void 0 && bundle.profile !== input.profileName)
+    warnings.push(
+      `\u5BFC\u51FA\u6587\u4EF6\u6765\u81EA profile\u300C${bundle.profile}\u300D\uFF0C\u672C\u673A\u662F\u300C${input.profileName}\u300D\uFF1A\u672C\u5730\u8DEF\u5F84\u5F62\u6001\u53EF\u80FD\u5BF9\u4E0D\u4E0A`
+    );
+  return {
+    source: input.source,
+    ...bundle.profile === void 0 ? {} : { exportProfile: bundle.profile },
+    ...bundle.exportedAt === void 0 ? {} : { exportedAt: bundle.exportedAt },
+    steps,
+    settings: { changed },
+    configRows: bundle.plugins.reduce((sum, plugin) => sum + (plugin.config?.length ?? 0), 0),
+    unattributedRows: (bundle.profilePatch?.unattributed ?? []).filter((row) => !isBuiltinPatch(row)).length,
+    builtinRows: (bundle.profilePatch?.builtin?.length ?? 0) + (bundle.profilePatch?.unattributed ?? []).filter(isBuiltinPatch).length,
+    unresolved: (bundle.profilePatch?.unattributed ?? []).filter((row) => !isBuiltinPatch(row)).map((row) => ({ ...row.id === void 0 ? {} : { id: row.id }, ...row.name === void 0 ? {} : { name: row.name }, reason: unresolvedPatchReason(row) })),
+    omissions: bundle.omissions ?? [],
+    warnings
+  };
+}
+function patchSnippet(bundle, profileName) {
+  const rows = [];
+  for (const plugin of bundle.plugins)
+    for (const row of plugin.config ?? [])
+      if (row.config !== void 0 || row.disabled !== void 0) rows.push(row);
+  if (rows.length === 0) return void 0;
+  const header = [
+    `# \u63D2\u4EF6\u6E2F\u6E7E\u5BFC\u51FA\uFF08${bundle.exportedAt ? new Date(bundle.exportedAt).toLocaleString("zh-CN", { hour12: false }) : "\u672A\u77E5\u65F6\u95F4"} \xB7 profile ${bundle.profile ?? "?"}\uFF09`,
+    `# \u8FD9\u4E9B\u884C\u5E26 config\uFF0C\u5BBF\u4E3B\u7684 pluginManager \u6CA1\u6709\u5199 config \u7684\u63A5\u53E3\uFF0C\u9700\u8981\u4F60\u786E\u8BA4\u540E\u81EA\u884C\u7C98\u8D34\u5230`,
+    `# ~/.dsh/profiles/${profileName}/cordis.patch.yml\uFF08profile \u8865\u4E01\u662F YAML \u5E8F\u5217\uFF0C\u5B57\u6BB5\u6309 id \u751F\u6548\uFF09`,
+    "# \u7C98\u8D34\u524D\u8BF7\u6838\u5BF9\uFF1A\u672C\u673A\u63D2\u4EF6\u7248\u672C/\u8DEF\u5F84\u53EF\u80FD\u4E0D\u540C\uFF0Cconfig \u91CC\u7684\u5730\u5740\u3001\u5BC6\u94A5\u7B49\u9700\u8981\u6309\u672C\u673A\u73AF\u5883\u8C03\u6574\u3002",
+    ""
+  ].join("\n");
+  return header + rows.map((row) => serializeRow(row)).join("\n") + "\n";
+}
+function redactRow(row) {
+  const config = row.config === void 0 ? void 0 : redactValue(row.config);
+  const count = config?.count ?? 0;
+  const out = {};
+  if (row.id !== void 0) out.id = row.id;
+  if (row.name !== void 0) out.name = row.name;
+  if (row.disabled !== void 0) out.disabled = row.disabled;
+  if (config !== void 0) out.config = config.value;
+  return { row: out, count };
+}
+function serializeRow(row) {
+  const lines = ["- id: " + JSON.stringify(row.id ?? "")];
+  if (row.name !== void 0) lines.push("  name: " + JSON.stringify(row.name));
+  if (typeof row.disabled === "boolean") lines.push("  disabled: " + String(row.disabled));
+  else if (typeof row.disabled === "string")
+    lines.push("  disabled: !!js " + JSON.stringify(row.disabled));
+  if (row.config !== void 0)
+    lines.push(
+      "  config:",
+      ...JSON.stringify(row.config, null, 2).split("\n").map((line) => "    " + line)
+    );
+  return lines.join("\n");
+}
+function isLocalExport(plugin) {
+  return plugin.kind === "path" || /^(?:file|link):|^[A-Za-z]:[\\/]|^\\\\|^\/|^\.\.?[\\/]|^~[\\/]/.test(plugin.spec) || plugin.kind === "tarball" && !/^(?:https?:|git\+https?:)/i.test(plugin.spec);
+}
+function installAddressFor(exported, profileDir, exists = existsSyncSafe) {
+  const source = {
+    name: exported.name,
+    spec: exported.spec,
+    kind: exported.kind,
+    ...exported.packageName === void 0 ? {} : { packageName: exported.packageName }
+  };
+  if (exported.kind === "registry") {
+    const version = exported.version;
+    return {
+      spec: installSpecFor(
+        source,
+        profileDir,
+        version === void 0 || version === "" ? void 0 : version
+      )
+    };
+  }
+  if (exported.kind === "git") return { spec: installSpecFor(source, profileDir) };
+  if (exported.kind === "tarball") {
+    const spec2 = installSpecFor(source, profileDir);
+    if (/^https?:\/\//i.test(spec2)) return { spec: spec2 };
+    const path2 = localPathOf(spec2);
+    if (path2 === void 0) return { spec: spec2 };
+    return exists(path2) ? { spec: spec2 } : {
+      blocked: `\u5BFC\u51FA\u8BB0\u5F55\u7684\u662F\u672C\u673A\u538B\u7F29\u5305\uFF08${path2}\uFF09\uFF0C\u76EE\u6807\u673A\u5668\u4E0A\u6CA1\u6709\u8FD9\u4E2A\u6587\u4EF6\uFF1A\u5148\u628A\u5305\u653E\u8FC7\u53BB\uFF0C\u6216\u6539\u7528 registry / git \u5730\u5740`
+    };
+  }
+  const spec = installSpecFor(source, profileDir);
+  const path = localPathOf(spec);
+  if (path === void 0) return { spec };
+  return exists(path) ? { spec } : {
+    blocked: `\u5BFC\u51FA\u8BB0\u5F55\u7684\u662F\u672C\u673A\u8DEF\u5F84\u5F62\u6001\uFF08${path}\uFF09\uFF0C\u76EE\u6807\u673A\u5668\u4E0A\u6CA1\u6709\u8FD9\u4E2A\u8DEF\u5F84\uFF1A\u5148\u628A\u5305\u653E\u5230\u8BE5\u4F4D\u7F6E\uFF0C\u6216\u6539\u7528 registry / git \u5730\u5740`
+  };
+}
+function localPathOf(spec) {
+  const local = /^(?:file|link):(.+)$/s.exec(spec);
+  if (local) return local[1].replace(/^~(?=$|[\\/])/, () => homedir2());
+  if (/^[A-Za-z]:[\\/]/.test(spec) || spec.startsWith("/") || spec.startsWith("./") || spec.startsWith("../"))
+    return spec;
+  return void 0;
+}
+function existsSyncSafe(path) {
+  try {
+    return statSync(path).isDirectory() || statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+function readProfilePatch(profileDir) {
+  let text2;
+  try {
+    text2 = readFileSync(join(profileDir, "cordis.patch.yml"), "utf8");
+  } catch (error) {
+    const code = error.code;
+    if (code === "ENOENT") return { rows: [] };
+    return { rows: [], error: error instanceof Error ? error.message : String(error) };
+  }
+  let document;
+  try {
+    document = parseYaml(text2, {
+      customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value) => ({ __jsExpr: value }) }]
+    });
+  } catch (error) {
+    return { rows: [], error: error instanceof Error ? error.message : String(error) };
+  }
+  if (!Array.isArray(document)) return { rows: [], error: "profile \u8865\u4E01\u4E0D\u662F YAML \u5E8F\u5217" };
+  const rows = [];
+  for (const item of document) {
+    if (!item || typeof item !== "object") continue;
+    const row = item;
+    if (Array.isArray(row.insert)) {
+      for (const inner of row.insert) {
+        if (!inner || typeof inner !== "object") continue;
+        rows.push(normalizeRow(inner));
+      }
+      continue;
+    }
+    rows.push(normalizeRow(row));
+  }
+  return { rows };
+}
+function normalizeRow(row) {
+  const out = {};
+  if (typeof row.id === "string") out.id = row.id;
+  if (typeof row.name === "string") out.name = row.name;
+  if (typeof row.disabled === "boolean") out.disabled = row.disabled;
+  else if (typeof row.disabled === "string") out.disabled = row.disabled;
+  else if (row.disabled && typeof row.disabled === "object" && typeof row.disabled.__jsExpr === "string") out.disabled = row.disabled.__jsExpr;
+  if (row.config !== void 0) out.config = row.config;
+  if (row.insert !== void 0) out.insert = row.insert;
+  return out;
+}
+function declaredRowIds(profileDir, name2) {
+  const dir = pluginDirOf(profileDir, name2);
+  if (dir === void 0) return [];
+  let patchPath;
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+    const declared = pkg?.dsh?.bundle?.patch;
+    if (typeof declared === "string") patchPath = resolve2(dir, declared);
+  } catch {
+    return [];
+  }
+  if (patchPath === void 0) return [];
+  let text2;
+  try {
+    text2 = readFileSync(patchPath, "utf8");
+  } catch {
+    return [];
+  }
+  const ids = [];
+  try {
+    const document = parseYaml(text2, {
+      customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value) => value }]
+    });
+    const visit = (value, depth = 0) => {
+      if (depth > 30 || !value || typeof value !== "object") return;
+      if (Array.isArray(value)) {
+        for (const row2 of value) visit(row2, depth + 1);
+        return;
+      }
+      const row = value;
+      if (typeof row.id === "string") ids.push(row.id);
+      if (Array.isArray(row.insert)) visit(row.insert, depth + 1);
+      if (row.group === true && Array.isArray(row.config)) visit(row.config, depth + 1);
+    };
+    visit(document);
+  } catch {
+    return [];
+  }
+  return [...new Set(ids)];
+}
+function pluginDirOf(profileDir, name2) {
+  const dir = join(profileDir, "node_modules", name2);
+  try {
+    statSync(dir);
+    return dir;
+  } catch {
+    return void 0;
+  }
+}
+function belongsTo(row, name2, rowIds) {
+  if (row.id !== void 0 && rowIds.includes(row.id)) return true;
+  if (row.name === name2) return true;
+  if (row.name !== void 0 && row.name.startsWith(name2 + "/")) return true;
+  return false;
+}
+function isEntryOf(moduleName, name2) {
+  if (moduleName === name2) return true;
+  return moduleName.startsWith(name2 + "/");
+}
+function dataDirCandidates(profileDir, plugin, entries) {
+  return [
+    .../* @__PURE__ */ new Set([
+      plugin.name,
+      plugin.name.split("/").pop() ?? plugin.name,
+      ...declaredRowIds(profileDir, plugin.name),
+      ...entries.map((entry) => entry.entryId.replace(/^include:/, ""))
+    ])
+  ];
+}
+function collectDataFiles(profileDir, plugin, entries, selfDirName) {
+  const result = { files: [], omissions: [], redactions: 0 };
+  for (const candidate of dataDirCandidates(profileDir, plugin, entries)) {
+    const dir = join(profileDir, candidate);
+    if (selfDirName !== void 0 && candidate === selfDirName) {
+      result.omissions.push({ path: candidate, reason: "\u672C\u63D2\u4EF6\u81EA\u5DF1\u7684\u6570\u636E\u76EE\u5F55\uFF08\u8BBE\u7F6E\u5DF2\u5355\u72EC\u5BFC\u51FA\uFF09" });
+      continue;
+    }
+    let isDir = false;
+    try {
+      isDir = statSync(dir).isDirectory();
+    } catch {
+      continue;
+    }
+    if (!isDir) continue;
+    let total = 0;
+    walk(dir, candidate, 0, (rel, absolute, size) => {
+      const name2 = basename(absolute);
+      if (EXCLUDED_FILE.test(name2)) {
+        result.omissions.push({ path: rel, reason: "\u6570\u636E\u5E93/\u65E5\u5FD7/\u9501/\u538B\u7F29\u5305\uFF0C\u4E0D\u5BFC\u51FA" });
+        return;
+      }
+      if (!TEXT_EXTENSIONS.has(extname(name2).toLowerCase())) {
+        result.omissions.push({ path: rel, reason: "\u975E\u6587\u672C\u6269\u5C55\u540D\uFF0C\u4E0D\u5BFC\u51FA" });
+        return;
+      }
+      if (size > MAX_FILE_BYTES) {
+        result.omissions.push({ path: rel, reason: `\u8D85\u8FC7 ${Math.round(MAX_FILE_BYTES / 1024)}KB\uFF0C\u4E0D\u5BFC\u51FA` });
+        return;
+      }
+      if (total + size > MAX_TOTAL_BYTES) {
+        result.omissions.push({ path: rel, reason: "\u8D85\u51FA\u672C\u6B21\u5BFC\u51FA\u7684\u603B\u4F53\u79EF\u4E0A\u9650\uFF0C\u4E0D\u5BFC\u51FA" });
+        return;
+      }
+      let text2;
+      try {
+        const raw = readFileSync(absolute);
+        if (raw.includes(0)) {
+          result.omissions.push({ path: rel, reason: "\u4E8C\u8FDB\u5236\u5185\u5BB9\uFF0C\u4E0D\u5BFC\u51FA" });
+          return;
+        }
+        text2 = raw.toString("utf8");
+      } catch (error) {
+        result.omissions.push({
+          path: rel,
+          reason: "\u8BFB\u53D6\u5931\u8D25\uFF1A" + (error instanceof Error ? error.message : String(error))
+        });
+        return;
+      }
+      const redacted = redactText(text2);
+      if (redacted.count > 0) result.redactions += redacted.count;
+      total += size;
+      result.files.push({ path: rel, bytes: size, content: redacted.text });
+    });
+  }
+  return result;
+}
+function walk(dir, prefix, depth, visit) {
+  if (depth > MAX_DEPTH) return;
+  let items;
+  try {
+    items = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const item of items.sort()) {
+    const absolute = join(dir, item);
+    const rel = prefix + "/" + item;
+    let stats;
+    try {
+      stats = statSync(absolute);
+    } catch {
+      continue;
+    }
+    if (stats.isDirectory()) {
+      if (EXCLUDED_DIRS.has(item.toLowerCase())) continue;
+      walk(absolute, rel, depth + 1, visit);
+      continue;
+    }
+    if (!stats.isFile()) continue;
+    visit(rel, absolute, stats.size);
+  }
+}
+function redactValue(value, key = "") {
+  if (typeof value === "string") {
+    const redacted = redactText(value);
+    if (normalizeKey(key) !== "" && SECRET_KEY.test(normalizeKey(key)))
+      return { value: REDACTED, count: Math.max(1, redacted.count) };
+    return { value: redacted.text, count: redacted.count };
+  }
+  if (Array.isArray(value)) {
+    let count = 0;
+    const out = value.map((item) => {
+      const nested = redactValue(item, key);
+      count += nested.count;
+      return nested.value;
+    });
+    return { value: out, count };
+  }
+  if (value && typeof value === "object") {
+    let count = 0;
+    const out = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      const nested = redactValue(childValue, childKey);
+      count += nested.count;
+      out[childKey] = nested.value;
+    }
+    return { value: out, count };
+  }
+  return { value, count: 0 };
+}
+function redactText(text2) {
+  let count = 0;
+  let out = text2;
+  for (const pattern of SECRET_VALUE) {
+    out = out.replace(new RegExp(pattern.source, "gi"), () => {
+      count += 1;
+      return REDACTED;
+    });
+  }
+  return { text: out, count };
+}
+function redactSettings(settings) {
+  const { value } = redactValue(settings);
+  return value;
+}
+function normalizeKey(key) {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+function ownedDataDirNames(profileDir, plugins, entries = [], selfDirName) {
+  const owned = /* @__PURE__ */ new Set();
+  for (const plugin of plugins)
+    for (const name2 of dataDirCandidates(profileDir, plugin, entries)) owned.add(name2);
+  if (selfDirName !== void 0) owned.add(selfDirName);
+  return owned;
+}
+function unownedProfileDirs(profileDir, owned) {
+  let items;
+  try {
+    items = readdirSync(profileDir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const item of items.sort()) {
+    if (owned.has(item)) continue;
+    if (item.startsWith(".")) continue;
+    if (["node_modules", "cache", "logs"].includes(item.toLowerCase())) continue;
+    try {
+      if (!statSync(join(profileDir, item)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+// src/git-sync/config.ts
+var secretKey = /token|secret|password|passwd|apikey|accesskey|privatekey|credential|cookie|authorization|sessionid/i;
+var machineKey = /(?:path|directory|datadir|cachedir|logdir|workdir|workspace|cwd|homedir|socket|proxy|registry)/i;
+var unsafeKey = /^(?:__proto__|prototype|constructor|__jsExpr)$/;
+var unsafeValue = /\[已脱敏\]|\[REDACTED\]|\bsk-[A-Za-z0-9_-]{16,}|\bgh[pousr]_[A-Za-z0-9]{16,}|\bnpm_[A-Za-z0-9]{16,}|\bBearer\s+\S+|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.|https?:\/\/[^/]*@/i;
+var localValue = /^(?:[A-Za-z]:[\\/]|\/|\\\\|\.\.?[\\/]|~[\\/]|file:|link:)/;
+var record = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+var fingerprint = (v) => createHash("sha256").update(JSON.stringify(v ?? {})).digest("hex");
+var sensitive = (value) => typeof value === "string" ? unsafeValue.test(value) || localValue.test(value) : Array.isArray(value) ? value.some(sensitive) : record(value) ? Object.entries(value).some(
+  ([k, v]) => secretKey.test(k.replace(/[-_]/g, "")) || machineKey.test(k) || unsafeKey.test(k) || sensitive(v)
+) : false;
+function safeConfigPatch(incoming) {
+  const skipped = [];
+  const walk2 = (value, prefix = "", depth = 0) => {
+    const out = {};
+    for (const [key, child] of Object.entries(value)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (depth > 20 || unsafeKey.test(key) || secretKey.test(key.replace(/[-_]/g, "")) || machineKey.test(key)) {
+        skipped.push(path);
+        continue;
+      }
+      if (record(child)) {
+        if (Object.hasOwn(child, "__jsExpr")) {
+          skipped.push(path);
+          continue;
+        }
+        const nested = walk2(child, path, depth + 1);
+        if (Object.keys(nested).length) out[key] = nested;
+      } else if (sensitive(child) || child === null || typeof child === "number" && !Number.isFinite(child)) {
+        skipped.push(path);
+      } else if (Array.isArray(child) || ["string", "number", "boolean"].includes(typeof child))
+        out[key] = structuredClone(child);
+      else skipped.push(path);
+    }
+    return out;
+  };
+  return {
+    patch: record(incoming) ? walk2(incoming) : {},
+    skipped: record(incoming) ? skipped : ["(\u914D\u7F6E\u4E0D\u662F\u666E\u901A\u5BF9\u8C61)"]
+  };
+}
+function mergeConfig(current, patch) {
+  if (!record(current)) throw Error("\u672C\u673A\u914D\u7F6E\u4E0D\u662F\u666E\u901A\u5BF9\u8C61");
+  const next = structuredClone(current);
+  const paths = [];
+  const merge = (target, source, prefix = "") => {
+    for (const [key, value] of Object.entries(source)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (record(value)) {
+        if (target[key] !== void 0 && !record(target[key]))
+          throw Error("\u914D\u7F6E\u7ED3\u6784\u4E0D\u540C\uFF0C\u9700\u8981\u4EBA\u5DE5\u5904\u7406");
+        if (target[key] === void 0) target[key] = {};
+        merge(target[key], value, path);
+      } else {
+        if (sensitive(target[key]))
+          throw Error("\u914D\u7F6E\u66FF\u6362\u4F1A\u5F71\u54CD\u672C\u673A\u654F\u611F\u5B57\u6BB5\uFF0C\u9700\u8981\u4EBA\u5DE5\u5904\u7406");
+        if (!isDeepStrictEqual(target[key], value)) {
+          target[key] = structuredClone(value);
+          paths.push(path);
+        }
+      }
+    }
+  };
+  merge(next, patch);
+  return { next, paths };
+}
+var owns = (entry, plugin) => entry.options.name === plugin || entry.options.name.startsWith(plugin + "/");
+function planConfigs(bundle, editor) {
+  const entries = editor?.entries() ?? [];
+  const plans = [];
+  for (const plugin of bundle.plugins) {
+    if (isLocalExport(plugin)) continue;
+    for (const row of plugin.config ?? []) {
+      if (row.config === void 0) continue;
+      const safe = safeConfigPatch(row.config);
+      const base = {
+        plugin: plugin.name,
+        id: row.id ?? "",
+        action: "manual",
+        paths: [],
+        skipped: safe.skipped
+      };
+      const candidates = entries.filter(
+        (e) => e.options.id === row.id && owns(e, plugin.name) && (!row.name || e.options.name === row.name)
+      );
+      if (!record(row.config)) base.reason = "\u914D\u7F6E\u4E0D\u662F\u666E\u901A\u5BF9\u8C61\uFF0C\u65E0\u6CD5\u5B89\u5168\u5408\u5E76";
+      else if (!Object.keys(safe.patch).length) {
+        base.action = "skip";
+        base.reason = "\u53EA\u6709\u51ED\u636E\u3001\u8DEF\u5F84\u3001\u8868\u8FBE\u5F0F\u6216\u7A7A\u914D\u7F6E\uFF0C\u4FDD\u7559\u672C\u673A\u503C\uFF0C\u65E0\u9700\u6062\u590D";
+      } else if (!editor) base.reason = "\u5BBF\u4E3B\u6CA1\u6709 configEditor \u914D\u7F6E\u670D\u52A1";
+      else if (!row.id || candidates.length !== 1 || candidates[0].fiber?.state !== 2)
+        base.reason = "\u63D2\u4EF6\u5C1A\u672A\u6FC0\u6D3B\u6216\u914D\u7F6E\u6761\u76EE\u65E0\u6CD5\u552F\u4E00\u5339\u914D\uFF1B\u5B89\u88C5/\u542F\u7528\u540E\u8BF7\u91CD\u65B0\u9884\u68C0";
+      else {
+        try {
+          const entry = candidates[0];
+          const merged = mergeConfig(entry.options.config ?? {}, safe.patch);
+          base.paths = merged.paths;
+          base.action = merged.paths.length ? "apply" : "skip";
+          if (base.action === "apply") {
+            base.patch = safe.patch;
+            base.expected = fingerprint(entry.options.config);
+          } else base.reason = "\u53EF\u8FC1\u79FB\u914D\u7F6E\u5DF2\u4E00\u81F4";
+        } catch {
+          base.reason = "\u914D\u7F6E\u7ED3\u6784\u6216\u672C\u673A\u654F\u611F\u5B57\u6BB5\u51B2\u7A81\uFF0C\u9700\u8981\u4EBA\u5DE5\u5904\u7406";
+        }
+      }
+      plans.push(base);
+    }
+  }
+  return plans;
+}
+async function applyConfig(plan, editor) {
+  if (plan.action !== "apply" || !plan.patch || !editor)
+    throw Error("\u914D\u7F6E\u6CA1\u6709\u53EF\u6267\u884C\u7684\u5BBF\u4E3B\u8BA1\u5212");
+  const entries = editor.entries().filter((e) => e.options.id === plan.id && owns(e, plan.plugin));
+  if (entries.length !== 1) throw Error("\u914D\u7F6E\u6761\u76EE\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+  const safe = safeConfigPatch(plan.patch);
+  if (safe.skipped.length) throw Error("\u914D\u7F6E\u8BA1\u5212\u542B\u53D7\u4FDD\u62A4\u5B57\u6BB5");
+  await editor.edit(entries[0], (current) => {
+    if (fingerprint(current) !== plan.expected)
+      throw Error("\u672C\u673A\u914D\u7F6E\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+    return mergeConfig(current, safe.patch).next;
+  });
+}
+
+// src/git-sync/service.ts
+import { spawn } from "node:child_process";
+import { createHash as createHash2, randomUUID } from "node:crypto";
+import {
+  mkdirSync,
+  readFileSync as readFileSync2,
+  writeFileSync,
+  renameSync,
+  rmSync
+} from "node:fs";
+import { join as join2, isAbsolute as isAbsolute2 } from "node:path";
+
+// src/ops/validate.ts
+var NAME = /^[A-Za-z0-9@][A-Za-z0-9@/._-]*$/;
+var SPEC = /^[A-Za-z0-9@.][A-Za-z0-9@/._~:+#=^%\\-]*$/;
+var CONTROL = /[\u0000-\u001f\u007f\s]/;
+function validateName(input) {
+  if (typeof input !== "string") return { ok: false, reason: "\u5305\u540D\u5FC5\u987B\u662F\u5B57\u7B26\u4E32" };
+  const name2 = input.trim();
+  if (name2 === "") return { ok: false, reason: "\u5305\u540D\u4E0D\u80FD\u4E3A\u7A7A" };
+  if (name2.length > 214) return { ok: false, reason: "\u5305\u540D\u8FC7\u957F\uFF08>214\uFF09" };
+  if (CONTROL.test(name2)) return { ok: false, reason: "\u5305\u540D\u542B\u7A7A\u767D\u6216\u63A7\u5236\u5B57\u7B26" };
+  if (name2.startsWith("-") || !NAME.test(name2))
+    return { ok: false, reason: `\u5305\u540D\u4E0D\u5408\u6CD5\uFF1A${name2}` };
+  return { ok: true, value: name2 };
+}
+function validateSpec(input) {
+  if (typeof input !== "string") return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u5FC5\u987B\u662F\u5B57\u7B26\u4E32" };
+  const spec = input.trim();
+  if (spec === "") return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u4E0D\u80FD\u4E3A\u7A7A" };
+  if (spec.length > 300) return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u8FC7\u957F\uFF08>300\uFF09" };
+  if (CONTROL.test(spec)) return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u542B\u7A7A\u767D\u6216\u63A7\u5236\u5B57\u7B26" };
+  if (spec.startsWith("-")) return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u4E0D\u80FD\u4EE5 `-` \u5F00\u5934" };
+  if (/^[\^~*]/.test(spec))
+    return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u7F3A\u5C11\u5305\u540D\uFF1A\u4E0D\u80FD\u4EE5\u7248\u672C\u8303\u56F4\u5F00\u5934" };
+  if (!SPEC.test(spec)) return { ok: false, reason: `\u5B89\u88C5\u5730\u5740\u542B\u975E\u6CD5\u5B57\u7B26\uFF1A${spec}` };
+  return { ok: true, value: spec };
+}
+function requireConfirm(input) {
+  return input === true ? { ok: true, value: "confirmed" } : { ok: false, reason: "\u8FD9\u4E2A\u64CD\u4F5C\u9700\u8981\u786E\u8BA4\uFF08\u754C\u9762\u4F1A\u5F39\u786E\u8BA4\u6846\uFF09" };
+}
+function validateTaskId(input) {
+  if (typeof input !== "string") return { ok: false, reason: "\u4EFB\u52A1 id \u5FC5\u987B\u662F\u5B57\u7B26\u4E32" };
+  const id = input.trim();
+  if (id === "" || id.length > 120 || CONTROL.test(id))
+    return { ok: false, reason: "\u4EFB\u52A1 id \u4E0D\u5408\u6CD5" };
+  return { ok: true, value: id };
+}
+
+// src/git-sync/service.ts
+var BRANCH = "harbor-sync";
+var LIMIT = 8 * 1024 * 1024;
+var digest = (text2) => createHash2("sha256").update(text2).digest("hex");
+function validateConfig(raw) {
+  const { remote, environment } = raw ?? {};
+  if (typeof remote !== "string" || remote.length > 2048 || /[\s\x00-\x1f\x7f]/.test(remote))
+    throw Error("\u4ED3\u5E93\u5730\u5740\u4E0D\u5408\u6CD5");
+  let allowed = isAbsolute2(remote);
+  if (/^(https|ssh):\/\//.test(remote)) {
+    try {
+      const u = new URL(remote);
+      allowed = !u.password && !u.search && !u.hash && !!u.hostname && (u.protocol === "ssh:" || !u.username);
+    } catch {
+      allowed = false;
+    }
+  } else if (/^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+:[a-zA-Z0-9/_.-]+$/.test(remote))
+    allowed = true;
+  if (!allowed || remote.startsWith("-"))
+    throw Error(
+      "\u4EC5\u652F\u6301\u65E0\u51ED\u636E\u7684 HTTPS\u3001SSH \u6216\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF1B\u8BF7\u4F7F\u7528\u7CFB\u7EDF Git \u8BA4\u8BC1"
+    );
+  if (typeof environment !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(environment))
+    throw Error(
+      "\u73AF\u5883\u540D\u987B\u4E3A 1\u201364 \u4F4D\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u4E0B\u5212\u7EBF\u6216\u8FDE\u5B57\u7B26\uFF0C\u9996\u4F4D\u4E3A\u5B57\u6BCD\u6216\u6570\u5B57"
+    );
+  return { remote, environment };
+}
+function portableBundle(bundle, installed = []) {
+  const copy = structuredClone(bundle);
+  const protectedNames = new Set(
+    installed.filter((p) => isLocalExport(p)).map((p) => p.name)
+  );
+  const excluded = copy.plugins.filter(
+    (p) => isLocalExport(p) || protectedNames.has(p.name)
+  );
+  const names = new Set(excluded.map((p) => p.name));
+  const ids = new Set(
+    excluded.flatMap((p) => [
+      ...(p.config ?? []).flatMap((r) => r.id ? [r.id] : []),
+      ...(p.entries ?? []).map((e) => e.entryId)
+    ])
+  );
+  const rows = new Set(
+    excluded.flatMap((p) => (p.config ?? []).map((r) => JSON.stringify(r)))
+  );
+  copy.plugins = copy.plugins.filter((p) => !names.has(p.name));
+  for (const p of excluded)
+    copy.omissions.push({
+      path: `plugins/${p.name}`,
+      reason: protectedNames.has(p.name) ? "\u76EE\u6807\u673A\u5668\u540C\u540D\u63D2\u4EF6\u4E3A\u672C\u5730\u5F00\u53D1\u7248\u672C\uFF1A\u5FFD\u7565\u8FDC\u7AEF\u5B89\u88C5\u3001\u542F\u505C\u53CA\u914D\u7F6E\uFF0C\u4FDD\u7559\u672C\u673A\u8DEF\u5F84" : "\u672C\u5730\u8DEF\u5F84/\u672C\u5730\u538B\u7F29\u5305\u4E0D\u53C2\u4E0E Git \u540C\u6B65\uFF1A\u5FFD\u7565\u5B89\u88C5\u3001\u542F\u505C\u548C\u914D\u7F6E\uFF0C\u4E0D\u53D1\u5E03\u6E90\u7801\u6216\u8DEF\u5F84"
+    });
+  if (copy.profilePatch) {
+    copy.profilePatch.attributed = copy.profilePatch.attributed.filter(
+      (id) => !ids.has(id)
+    );
+    copy.profilePatch.unattributed = copy.profilePatch.unattributed.filter(
+      (r) => !ids.has(r.id ?? "") && !rows.has(JSON.stringify(r)) && ![...names].some(
+        (name2) => r.name === name2 || r.name?.startsWith(name2 + "/")
+      )
+    );
+  }
+  delete copy.settings;
+  return copy;
+}
+function publicationBundle(local, remote, installed) {
+  const copy = portableBundle(local);
+  if (!remote) return copy;
+  const protectedNames = new Set(
+    installed.filter((p) => isLocalExport(p)).map((p) => p.name)
+  );
+  for (const plugin of portableBundle(remote).plugins) {
+    if (!protectedNames.has(plugin.name)) continue;
+    copy.plugins = copy.plugins.filter((p) => p.name !== plugin.name);
+    copy.plugins.push(plugin);
+    copy.omissions.push({
+      path: `plugins/${plugin.name}/local`,
+      reason: "\u672C\u673A\u672C\u5730\u5F00\u53D1\u7248\u672C\u5DF2\u5FFD\u7565\uFF1B\u53D1\u5E03\u65F6\u4FDD\u7559\u8FDC\u7AEF\u539F\u6709\u7684\u5B89\u88C5\u4E0E\u914D\u7F6E\u8BB0\u5F55"
+    });
+  }
+  return copy;
+}
+function snapshot(bundle) {
+  const copy = structuredClone(bundle);
+  copy.exportedAt = 0;
+  copy.plugins.sort((a, b) => a.name.localeCompare(b.name, "en"));
+  const order = (v) => Array.isArray(v) ? v.map(order) : v && typeof v === "object" ? Object.fromEntries(
+    Object.keys(v).sort().map((k) => [k, order(v[k])])
+  ) : v;
+  return JSON.stringify(order(copy), null, 2) + "\n";
+}
+function parseSnapshot(text2) {
+  if (Buffer.byteLength(text2) > LIMIT) throw Error("\u5FEB\u7167\u8D85\u8FC7 8MB");
+  const parsed = readExport(text2);
+  if (!parsed.bundle) throw Error(`\u5FEB\u7167\u683C\u5F0F\u9519\u8BEF\uFF1A${parsed.error}`);
+  const b = parsed.bundle;
+  if (!Array.isArray(b.omissions) || !b.omissions.every(
+    (x) => x && typeof x.path === "string" && typeof x.reason === "string"
+  ) || !Array.isArray(b.warnings) || !b.warnings.every((x) => typeof x === "string"))
+    throw Error("\u5FEB\u7167\u5B57\u6BB5\u4E0D\u5408\u6CD5");
+  const names = /* @__PURE__ */ new Set();
+  for (const p of b.plugins) {
+    if (names.has(p.name) || typeof p.enabled !== "boolean" || !["registry", "git", "tarball", "path", "unknown"].includes(p.kind))
+      throw Error("\u5FEB\u7167\u63D2\u4EF6\u5B57\u6BB5\u4E0D\u5408\u6CD5\u6216\u91CD\u590D");
+    names.add(p.name);
+    for (const value of [p.spec, p.repo, p.packageName]) {
+      if (value !== void 0 && (typeof value !== "string" || /(?:https?:\/\/)[^/]*@|[?&](?:token|key|secret|password)=/i.test(
+        value
+      )))
+        throw Error("\u5B89\u88C5\u6765\u6E90\u542B\u51ED\u636E\u6216\u5B57\u6BB5\u4E0D\u5408\u6CD5\uFF0C\u8BF7\u5148\u6539\u4E3A\u65E0\u51ED\u636E\u5730\u5740");
+    }
+    if (p.version !== void 0 && typeof p.version !== "string")
+      throw Error("\u7248\u672C\u5B57\u6BB5\u4E0D\u5408\u6CD5");
+    const address = installAddressFor(p, "", () => false);
+    if (address.spec && !validateSpec(address.spec).ok)
+      throw Error("\u5FEB\u7167\u5305\u542B\u4E0D\u5408\u6CD5\u7684\u5B89\u88C5\u5730\u5740");
+    if (p.entries !== void 0 && (!Array.isArray(p.entries) || !p.entries.every(
+      (e) => e && typeof e.entryId === "string" && typeof e.moduleName === "string" && typeof e.enabled === "boolean"
+    )))
+      throw Error("\u5FEB\u7167\u6761\u76EE\u4E0D\u5408\u6CD5");
+    if (p.config !== void 0 && (!Array.isArray(p.config) || !p.config.every((x) => x && typeof x === "object")))
+      throw Error("\u5FEB\u7167\u914D\u7F6E\u4E0D\u5408\u6CD5");
+  }
+  if (b.profilePatch !== void 0 && (!b.profilePatch || !Array.isArray(b.profilePatch.unattributed)))
+    throw Error("\u5FEB\u7167\u8865\u4E01\u4E0D\u5408\u6CD5");
+  return b;
+}
+var GitSync = class {
+  constructor(root) {
+    this.root = root;
+  }
+  busy = false;
+  abort;
+  config() {
+    try {
+      return validateConfig(
+        JSON.parse(readFileSync2(join2(this.root, "config.json"), "utf8"))
+      );
+    } catch (e) {
+      if (e.code === "ENOENT") return null;
+      throw Error("Git \u540C\u6B65\u8BBE\u7F6E\u635F\u574F\uFF0C\u8BF7\u91CD\u65B0\u4FDD\u5B58");
+    }
+  }
+  configure(raw) {
+    if (this.busy) throw Error("\u540C\u6B65\u64CD\u4F5C\u6B63\u5728\u8FD0\u884C");
+    const config = validateConfig(raw);
+    mkdirSync(this.root, { recursive: true });
+    writeFileSync(join2(this.root, "config.tmp"), JSON.stringify(config));
+    renameSync(join2(this.root, "config.tmp"), join2(this.root, "config.json"));
+    return config;
+  }
+  cancel() {
+    this.abort?.abort();
+    return { cancelled: !!this.abort };
+  }
+  async locked(run) {
+    if (this.busy) throw Error("\u540C\u6B65\u64CD\u4F5C\u6B63\u5728\u8FD0\u884C");
+    this.busy = true;
+    this.abort = new AbortController();
+    try {
+      return await run();
+    } finally {
+      this.busy = false;
+      this.abort = void 0;
+    }
+  }
+  async git(args, cwd, input, env = {}) {
+    return await new Promise((resolve4, reject) => {
+      const inherited = { ...process.env };
+      for (const key of Object.keys(inherited))
+        if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG.*)$/i.test(
+          key
+        ))
+          delete inherited[key];
+      const child = spawn(
+        "git",
+        ["-c", "core.hooksPath=", "-c", "protocol.ext.allow=never", ...args],
+        {
+          cwd,
+          shell: false,
+          windowsHide: true,
+          env: {
+            ...inherited,
+            GIT_TERMINAL_PROMPT: "0",
+            GCM_INTERACTIVE: "never",
+            ...env
+          },
+          stdio: ["pipe", "pipe", "pipe"]
+        }
+      );
+      let output = "";
+      let bytes = 0;
+      let failure2 = "";
+      const stop = () => {
+        failure2 = "Git \u64CD\u4F5C\u5DF2\u53D6\u6D88";
+        child.kill();
+      };
+      const timer = setTimeout(() => {
+        failure2 = "Git \u64CD\u4F5C\u8D85\u65F6";
+        child.kill();
+      }, 3e4);
+      this.abort?.signal.addEventListener("abort", stop, { once: true });
+      if (this.abort?.signal.aborted) stop();
+      const chunks = [];
+      child.stdout.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > LIMIT) {
+          failure2 = "Git \u8F93\u51FA\u8D85\u8FC7\u9650\u5236";
+          child.kill();
+        } else chunks.push(chunk);
+      });
+      child.stderr.resume();
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.abort?.signal.removeEventListener("abort", stop);
+      };
+      child.on("error", () => {
+        cleanup();
+        reject(Error("\u65E0\u6CD5\u8FD0\u884C Git\uFF0C\u8BF7\u68C0\u67E5 Git \u5B89\u88C5"));
+      });
+      child.on("close", (code) => {
+        cleanup();
+        output = Buffer.concat(chunks).toString("utf8");
+        code === 0 && !failure2 ? resolve4(output.trimEnd()) : reject(
+          Error(
+            failure2 || "Git \u64CD\u4F5C\u5931\u8D25\uFF1A\u8BF7\u68C0\u67E5\u6743\u9650\u3001\u7CFB\u7EDF\u8BA4\u8BC1\u3001\u7F51\u7EDC\u6216\u8FDC\u7AEF\u662F\u5426\u5DF2\u53D8\u5316"
+          )
+        );
+      });
+      child.stdin.on("error", () => {
+      });
+      child.stdin.end(input);
+    });
+  }
+  async repo(config) {
+    const dir = join2(this.root, digest(config.remote));
+    mkdirSync(dir, { recursive: true });
+    await this.git(["init", "--bare", "."], dir);
+    return dir;
+  }
+  async head(config, dir) {
+    const out = await this.git(
+      ["ls-remote", "--refs", config.remote, `refs/heads/${BRANCH}`],
+      dir
+    );
+    if (!out) return null;
+    if (!/^[a-f0-9]{40,64}\s/.test(out)) throw Error("\u8FDC\u7AEF commit \u4E0D\u5408\u6CD5");
+    await this.git(
+      ["fetch", "--no-tags", config.remote, `refs/heads/${BRANCH}`],
+      dir
+    );
+    return await this.git(["rev-parse", "FETCH_HEAD"], dir);
+  }
+  path(c) {
+    return `harbor/environments/${c.environment}/snapshot.json`;
+  }
+  async inspect() {
+    const c = this.config();
+    if (!c) throw Error("\u8BF7\u5148\u4FDD\u5B58\u540C\u6B65\u4ED3\u5E93");
+    const dir = await this.repo(c);
+    const commit = await this.head(c, dir);
+    if (!commit) return { commit: null, text: null, history: [] };
+    const path = this.path(c);
+    const entry = await this.git(["ls-tree", commit, "--", path], dir);
+    let text2 = null;
+    if (entry) {
+      if (!entry.startsWith("100644 blob "))
+        throw Error("\u8FDC\u7AEF\u5FEB\u7167\u5FC5\u987B\u662F\u666E\u901A\u6587\u4EF6");
+      text2 = await this.git(["show", `${commit}:${path}`], dir);
+      parseSnapshot(text2);
+    }
+    const history = (await this.git(["log", "-10", "--format=%h %aI", commit, "--", path], dir)).split("\n").filter(Boolean);
+    return { commit, text: text2, history };
+  }
+  async publish(text2, expected) {
+    parseSnapshot(text2);
+    const c = this.config();
+    if (!c) throw Error("\u8BF7\u5148\u4FDD\u5B58\u540C\u6B65\u4ED3\u5E93");
+    const dir = await this.repo(c);
+    const head = await this.head(c, dir);
+    if (head !== expected) throw Error("\u8FDC\u7AEF\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u5E76\u786E\u8BA4\u53D1\u5E03");
+    const index = join2(dir, `index-${randomUUID()}`);
+    const env = {
+      GIT_INDEX_FILE: index,
+      GIT_AUTHOR_NAME: "Plugin Harbor",
+      GIT_AUTHOR_EMAIL: "harbor@localhost",
+      GIT_COMMITTER_NAME: "Plugin Harbor",
+      GIT_COMMITTER_EMAIL: "harbor@localhost"
+    };
+    try {
+      await this.git(
+        head ? ["read-tree", head] : ["read-tree", "--empty"],
+        dir,
+        void 0,
+        env
+      );
+      const blob = await this.git(["hash-object", "-w", "--stdin"], dir, text2);
+      await this.git(
+        [
+          "update-index",
+          "--add",
+          "--cacheinfo",
+          `100644,${blob},${this.path(c)}`
+        ],
+        dir,
+        void 0,
+        env
+      );
+      const tree = await this.git(["write-tree"], dir, void 0, env);
+      if (head && tree === await this.git(["rev-parse", `${head}^{tree}`], dir))
+        return { commit: head, unchanged: true };
+      const commit = await this.git(
+        [
+          "commit-tree",
+          tree,
+          ...head ? ["-p", head] : [],
+          "-m",
+          `Harbor snapshot: ${c.environment}`
+        ],
+        dir,
+        void 0,
+        env
+      );
+      await this.git(["push", c.remote, `${commit}:refs/heads/${BRANCH}`], dir);
+      return { commit, unchanged: false };
+    } finally {
+      rmSync(index, { force: true });
+    }
+  }
+};
+
 // src/index.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync2, readdirSync as readdirSync2, readFileSync as readFileSync4, realpathSync as realpathSync2, statSync as statSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { randomUUID as randomUUID2 } from "node:crypto";
+import { existsSync as existsSync5, mkdirSync as mkdirSync3, readdirSync as readdirSync2, readFileSync as readFileSync5, realpathSync as realpathSync2, statSync as statSync2, writeFileSync as writeFileSync3 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { dirname as dirname3, isAbsolute as isAbsolute2, join as join7, resolve as resolve3 } from "node:path";
+import { dirname as dirname3, isAbsolute as isAbsolute3, join as join8, resolve as resolve3 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/core/dispatch.ts
@@ -57,11 +1267,11 @@ function createDispatcher(handlers2) {
 }
 
 // src/core/paths.ts
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir as homedir3 } from "node:os";
+import { join as join3 } from "node:path";
 var PROFILE_NAME = /^[A-Za-z0-9_.-]+$/;
 function dshHome() {
-  return process.env.DSH_HOME ?? join(homedir(), ".dsh");
+  return process.env.DSH_HOME ?? join3(homedir3(), ".dsh");
 }
 function assertProfileName(name2) {
   if (name2 === "." || name2 === ".." || !PROFILE_NAME.test(name2))
@@ -73,9 +1283,9 @@ function resolveProfile(ctx) {
   const name2 = assertProfileName(
     context.name ?? process.env.DSH_PROFILE ?? "desktop"
   );
-  const dir = join(dshHome(), "profiles", name2);
-  const dataDir = join(dir, "plugin-harbor");
-  return { name: name2, dir, dataDir, dbPath: join(dataDir, "catalog.sqlite") };
+  const dir = join3(dshHome(), "profiles", name2);
+  const dataDir = join3(dir, "plugin-harbor");
+  return { name: name2, dir, dataDir, dbPath: join3(dataDir, "catalog.sqlite") };
 }
 
 // src/core/flight.ts
@@ -285,30 +1495,30 @@ function extractPluginRecord(payload) {
 function readDetailRecord(payload) {
   const extracted = extractPluginRecord(payload);
   if (!extracted) return void 0;
-  const record = extracted.record;
-  const slug = text(record.slug);
-  const repo = text(record.source?.repo);
+  const record2 = extracted.record;
+  const slug = text(record2.slug);
+  const repo = text(record2.source?.repo);
   if (slug === "" || repo === "") return void 0;
   const out = {
     slug,
     repo,
-    npmPackage: text(record.source?.npmPackage)
+    npmPackage: text(record2.source?.npmPackage)
   };
-  const version = text(record.version);
+  const version = text(record2.version);
   if (version !== "") out.version = version;
-  const installType = text(record.install?.type);
+  const installType = text(record2.install?.type);
   if (installType !== "") out.installType = installType;
-  const command = text(record.install?.command);
+  const command = text(record2.install?.command);
   if (command !== "") out.installCommand = command;
-  if (typeof record.install?.webInstallable === "boolean")
-    out.webInstallable = record.install.webInstallable;
-  if (typeof record.compatibility?.dshTarget === "string")
-    out.dshTarget = record.compatibility.dshTarget;
-  const status = text(record.compatibility?.status);
+  if (typeof record2.install?.webInstallable === "boolean")
+    out.webInstallable = record2.install.webInstallable;
+  if (typeof record2.compatibility?.dshTarget === "string")
+    out.dshTarget = record2.compatibility.dshTarget;
+  const status = text(record2.compatibility?.status);
   if (status !== "") out.status = status;
-  if (Array.isArray(record.compatibility?.platforms))
-    out.platforms = list(record.compatibility.platforms);
-  const reason = text(record.manualInstallReason);
+  if (Array.isArray(record2.compatibility?.platforms))
+    out.platforms = list(record2.compatibility.platforms);
+  const reason = text(record2.manualInstallReason);
   if (reason !== "") out.manualInstallReason = reason;
   return out;
 }
@@ -555,13 +1765,13 @@ async function syncCatalog(deps) {
 }
 
 // src/core/installed.ts
-import { existsSync, readFileSync } from "node:fs";
-import { join as join2 } from "node:path";
-import { parse as parseYaml } from "yaml";
+import { existsSync, readFileSync as readFileSync3 } from "node:fs";
+import { join as join4 } from "node:path";
+import { parse as parseYaml2 } from "yaml";
 var HOST_SCOPE = "@deepseek-ai/";
 function readJson(path) {
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
+    return JSON.parse(readFileSync3(path, "utf8"));
   } catch {
     return void 0;
   }
@@ -575,8 +1785,8 @@ function githubRepoOf(url) {
     if (short) return `${short[1]}/${short[2].replace(/\.git$/, "")}`;
   }
   if (url && typeof url === "object") {
-    const record = url;
-    return githubRepoOf(record.url ?? record.directory ?? void 0);
+    const record2 = url;
+    return githubRepoOf(record2.url ?? record2.directory ?? void 0);
   }
   return void 0;
 }
@@ -593,10 +1803,10 @@ function classifySpec(spec) {
   return "registry";
 }
 function readLockfile(profileDir) {
-  const path = join2(profileDir, "pnpm-lock.yaml");
+  const path = join4(profileDir, "pnpm-lock.yaml");
   if (!existsSync(path)) return void 0;
   try {
-    return parseYaml(readFileSync(path, "utf8"));
+    return parseYaml2(readFileSync3(path, "utf8"));
   } catch {
     return void 0;
   }
@@ -620,7 +1830,7 @@ function commitOfTarball(tarball) {
   return match ? match[1].toLowerCase() : void 0;
 }
 function readInstalledPlugins(profileDir) {
-  const manifest = readJson(join2(profileDir, "package.json"));
+  const manifest = readJson(join4(profileDir, "package.json"));
   if (!manifest || typeof manifest !== "object") return [];
   const dependencies = manifest.dependencies && typeof manifest.dependencies === "object" ? manifest.dependencies : {};
   const bundles = Array.isArray(manifest.dsh?.profile?.bundles) ? manifest.dsh.profile.bundles.filter(
@@ -636,8 +1846,8 @@ function readInstalledPlugins(profileDir) {
     const spec = typeof entry?.specifier === "string" && entry.specifier !== "" ? entry.specifier : declared;
     const resolved = typeof entry?.version === "string" && entry.version !== "" ? entry.version : void 0;
     const kind = classifySpec(spec);
-    const pkgDir = join2(profileDir, "node_modules", name2);
-    const pkg = readJson(join2(pkgDir, "package.json"));
+    const pkgDir = join4(profileDir, "node_modules", name2);
+    const pkg = readJson(join4(pkgDir, "package.json"));
     const pkgEntry = findPackage(lockfile, name2, resolved);
     const tarball = pkgEntry?.resolution?.tarball ?? (kind === "git" ? resolved : void 0);
     const plugin = {
@@ -662,644 +1872,6 @@ function readInstalledPlugins(profileDir) {
     plugins.push(plugin);
   }
   return plugins.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-// src/core/transfer.ts
-import { readFileSync as readFileSync2, readdirSync, statSync } from "node:fs";
-import { homedir as homedir3 } from "node:os";
-import { basename, extname, join as join3, resolve as resolve2 } from "node:path";
-import { parse as parseYaml2 } from "yaml";
-
-// src/ops/spec.ts
-import { homedir as homedir2 } from "node:os";
-import { isAbsolute, resolve } from "node:path";
-var LOCAL_PROTOCOL = /^(file|link):(.*)$/s;
-var NON_REGISTRY_VALUE = /^(?!(?:npm|jsr|workspace|catalog):)[a-z][a-z0-9+.-]*:|^[^@/:\s]+@[^:/\s]+:/i;
-var HTTP_USER_INFO = /^((?:git\+)?https?:\/\/)[^/]*@/i;
-function redactSpec(value) {
-  return value.replace(HTTP_USER_INFO, "$1");
-}
-function installSpecFor(source, profileDir, targetVersion) {
-  const name2 = source.name;
-  const recorded = (source.spec ?? "").trim();
-  const local = LOCAL_PROTOCOL.exec(recorded);
-  if (local) return withName(name2, `${local[1]}:${absoluteLocal(local[2], profileDir)}`, source.packageName);
-  if (recorded !== "" && NON_REGISTRY_VALUE.test(recorded))
-    return withName(name2, redactSpec(recorded), source.packageName);
-  if (source.kind === "path" || source.kind === "tarball") {
-    if (profileDir === void 0) return withName(name2, recorded, source.packageName);
-    const bare = recorded.replace(/^(file|link):/, "");
-    return withName(name2, `file:${absoluteLocal(bare, profileDir)}`, source.packageName);
-  }
-  const range = targetVersion !== void 0 && targetVersion !== "" ? targetVersion : recorded;
-  return `${name2}@${range === "" ? "latest" : range}`;
-}
-function latestSpec(kind, spec, name2, profileDir) {
-  const text2 = spec.trim();
-  if (kind === "registry") return `${name2}@latest`;
-  const looksRegistry = kind === void 0 && (/^(\^|~)?\d|^\*$|^latest$/i.test(text2) || text2 === "");
-  if (looksRegistry) return `${name2}@latest`;
-  if (kind === void 0 && text2 === "") return `${name2}@latest`;
-  return installSpecFor(
-    { name: name2, spec: text2, kind: kind === "git" || kind === "path" || kind === "tarball" ? kind : "unknown" },
-    profileDir
-  );
-}
-function absoluteLocal(path, profileDir) {
-  const expanded = path.replace(/^~(?=$|[\\/])/, () => homedir2());
-  if (isAbsolute(expanded)) return expanded;
-  if (expanded.startsWith("~/") || expanded.startsWith("~\\")) return expanded;
-  return profileDir === void 0 ? expanded : resolve(profileDir, expanded);
-}
-function withName(name2, spec, packageName) {
-  const own = packageName ?? name2;
-  return own === name2 ? spec : `${name2}@${spec}`;
-}
-
-// src/core/transfer.ts
-var EXPORT_FORMAT = "dsh-plugin-harbor/export";
-var EXPORT_VERSION = 1;
-var MAX_FILE_BYTES = 256 * 1024;
-var MAX_TOTAL_BYTES = 4 * 1024 * 1024;
-var MAX_DEPTH = 3;
-var TEXT_EXTENSIONS = /* @__PURE__ */ new Set([
-  ".json",
-  ".jsonc",
-  ".yml",
-  ".yaml",
-  ".txt",
-  ".md",
-  ".toml",
-  ".ini",
-  ".cfg",
-  ".conf"
-]);
-var EXCLUDED_DIRS = /* @__PURE__ */ new Set([
-  "node_modules",
-  "cache",
-  "caches",
-  ".git",
-  "exports",
-  "logs",
-  "log",
-  "tmp",
-  "temp"
-]);
-var EXCLUDED_FILE = /\.(sqlite3?|db|db3|log|lock|tgz|tar|gz|zip|bin|node|dll|exe|so|dylib)(-wal|-shm)?$/i;
-var SECRET_KEY = /(token|secret|passwd|password|apikey|accesskey|privatekey|credential|cookie|authorization|sessionid|clientsecret)/;
-var SECRET_VALUE = [
-  /\bsk-[A-Za-z0-9_-]{16,}/,
-  /\bgh[pousr]_[A-Za-z0-9]{16,}/,
-  /\bnpm_[A-Za-z0-9]{16,}/,
-  /\bBearer\s+\S+/i,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./,
-  /:\/\/[^/\s:@]+:[^/\s:@]+@/
-];
-var REDACTED = "[\u5DF2\u8131\u654F]";
-function buildExport(input) {
-  const now = input.now ?? Date.now();
-  const warnings = [];
-  const omissions = [];
-  const patch = readProfilePatch(input.profileDir);
-  if (patch.error !== void 0) warnings.push(`profile \u8865\u4E01\u672A\u80FD\u89E3\u6790\uFF1A${patch.error}`);
-  const unattributed = [];
-  const attributed = [];
-  let redactions = 0;
-  const plugins = input.plugins.map((plugin) => {
-    const rowIds = declaredRowIds(input.profileDir, plugin.name);
-    const myEntries = (input.entries ?? []).filter((entry) => isEntryOf(entry.moduleName, plugin.name));
-    const mine = [];
-    for (const row of patch.rows) {
-      if (!belongsTo(row, plugin.name, rowIds)) continue;
-      if (row.id !== void 0) attributed.push(row.id);
-      const safe = redactRow(row);
-      redactions += safe.count;
-      mine.push(safe.row);
-    }
-    const exported = {
-      name: plugin.name,
-      spec: plugin.spec,
-      kind: plugin.kind,
-      enabled: plugin.selected
-    };
-    if (plugin.version !== void 0) exported.version = plugin.version;
-    if (plugin.repo !== void 0) exported.repo = plugin.repo;
-    if (plugin.packageName !== void 0) exported.packageName = plugin.packageName;
-    if (input.entries !== void 0)
-      exported.entries = myEntries.map((entry) => ({
-        entryId: entry.entryId,
-        moduleName: entry.moduleName,
-        enabled: entry.enabled
-      }));
-    if (mine.length > 0) exported.config = mine;
-    if (input.includeData === true) {
-      const scan = collectDataFiles(input.profileDir, plugin, myEntries, input.selfDirName);
-      omissions.push(...scan.omissions);
-      redactions += scan.redactions;
-      if (scan.files.length > 0) exported.files = scan.files;
-    }
-    return exported;
-  });
-  for (const row of patch.rows) {
-    if (row.id !== void 0 && attributed.includes(row.id)) continue;
-    if (row.config === void 0 && row.disabled === void 0) continue;
-    const safe = redactRow(row);
-    redactions += safe.count;
-    unattributed.push(safe.row);
-  }
-  if (patch.rows.length > 0 && unattributed.length > 0)
-    warnings.push(
-      `\u6709 ${unattributed.length} \u884C\u8865\u4E01\u6CA1\u5F52\u5230\u5BFC\u51FA\u8303\u56F4\u5185\u7684\u5DF2\u88C5\u63D2\u4EF6\uFF08\u591A\u534A\u914D\u7F6E\u7684\u662F\u5BBF\u4E3B\u81EA\u5E26\u6761\u76EE\u6216\u5176\u4ED6\u5305\uFF09\uFF0C\u5DF2\u539F\u6837\u653E\u5728 profilePatch.unattributed \u91CC`
-    );
-  if (input.includeData === true) {
-    if (redactions > 0)
-      warnings.push(`\u63D2\u4EF6\u8BBE\u7F6E\u91CC\u6709 ${redactions} \u5904\u7591\u4F3C\u51ED\u636E\u7684\u5B57\u6BB5/\u53D6\u503C\uFF0C\u5DF2\u66FF\u6362\u4E3A ${REDACTED}`);
-    warnings.push("\u63D2\u4EF6\u81EA\u5DF1\u7684\u8BBE\u7F6E\u6587\u4EF6\u53EA\u5BFC\u51FA\u3001\u4E0D\u81EA\u52A8\u5BFC\u5165\uFF1A\u90A3\u662F\u5404\u63D2\u4EF6\u81EA\u5DF1\u7684\u6570\u636E\uFF0C\u672C\u9879\u76EE\u4E0D\u4EE3\u5199");
-    const owned = ownedDataDirNames(
-      input.profileDir,
-      input.plugins,
-      input.entries ?? [],
-      input.selfDirName
-    );
-    for (const dir of unownedProfileDirs(input.profileDir, owned))
-      omissions.push({ path: dir, reason: "\u8BA4\u4E0D\u51FA\u5C5E\u4E8E\u54EA\u4E2A\u5DF2\u88C5\u63D2\u4EF6\uFF0C\u672A\u5BFC\u51FA\u5176\u5185\u5BB9" });
-  }
-  if (input.entries === void 0)
-    warnings.push("\u5BBF\u4E3B pluginManager \u670D\u52A1\u4E0D\u53EF\u7528\uFF1A\u672A\u5305\u542B\u6761\u76EE\u7EA7\u4FE1\u606F\uFF08\u6761\u76EE\u5F00\u5173\u65E0\u6CD5\u5BFC\u51FA/\u5BFC\u5165\uFF09");
-  const bundle = {
-    format: EXPORT_FORMAT,
-    version: EXPORT_VERSION,
-    exportedAt: now,
-    profile: input.profileName,
-    by: { plugin: "plugin-harbor", version: input.pluginVersion },
-    plugins,
-    profilePatch: {
-      attributed: [...new Set(attributed)],
-      unattributed,
-      ...patch.error === void 0 ? {} : { error: patch.error }
-    },
-    omissions,
-    warnings
-  };
-  bundle.settings = redactSettings(input.settings);
-  return bundle;
-}
-function serializeExport(bundle) {
-  return JSON.stringify(bundle, null, 2) + "\n";
-}
-function exportFileName(profileName, now) {
-  const stamp = new Date(now).toISOString().replace(/[:.]/g, "-").replace(/Z$/, "");
-  return `${stamp}-${profileName}.json`;
-}
-function readExport(text2) {
-  let parsed;
-  try {
-    parsed = JSON.parse(text2);
-  } catch (error) {
-    return { error: "\u4E0D\u662F\u5408\u6CD5 JSON\uFF1A" + (error instanceof Error ? error.message : String(error)) };
-  }
-  if (!parsed || typeof parsed !== "object") return { error: "\u5185\u5BB9\u4E0D\u662F\u5BF9\u8C61" };
-  if (parsed.format !== EXPORT_FORMAT)
-    return { error: `\u4E0D\u662F\u63D2\u4EF6\u6E2F\u6E7E\u7684\u5BFC\u51FA\u6587\u4EF6\uFF08format=${String(parsed.format)}\uFF09` };
-  if (parsed.version !== EXPORT_VERSION)
-    return { error: `\u5BFC\u51FA\u683C\u5F0F\u7248\u672C\u4E0D\u652F\u6301\uFF1A${String(parsed.version)}\uFF08\u672C\u63D2\u4EF6\u652F\u6301 ${EXPORT_VERSION}\uFF09` };
-  if (!Array.isArray(parsed.plugins)) return { error: "\u7F3A\u5C11 plugins \u6570\u7EC4" };
-  for (const plugin of parsed.plugins) {
-    if (!plugin || typeof plugin.name !== "string" || plugin.name === "")
-      return { error: "plugins \u91CC\u6709\u6761\u76EE\u7F3A\u5C11 name" };
-    if (typeof plugin.spec !== "string") return { error: `\u63D2\u4EF6 ${plugin.name} \u7F3A\u5C11 spec` };
-    if (typeof plugin.kind !== "string") return { error: `\u63D2\u4EF6 ${plugin.name} \u7F3A\u5C11 kind` };
-  }
-  return { bundle: parsed };
-}
-function planImport(input) {
-  const exists = input.exists ?? existsSyncSafe;
-  const byName = new Map(input.installed.map((plugin) => [plugin.name, plugin]));
-  const entryByName = /* @__PURE__ */ new Map();
-  for (const entry of input.entries ?? []) {
-    const owner = [...byName.keys()].find((name2) => isEntryOf(entry.moduleName, name2));
-    if (owner === void 0) continue;
-    const list2 = entryByName.get(owner) ?? [];
-    list2.push(entry);
-    entryByName.set(owner, list2);
-  }
-  const steps = [];
-  for (const exported of input.bundle.plugins) {
-    const current = byName.get(exported.name);
-    const kind = exported.kind;
-    if (current === void 0) {
-      const address = installAddressFor(exported, input.profileDir, exists);
-      if (address.blocked !== void 0) {
-        steps.push({ name: exported.name, action: "blocked", kind, reason: address.blocked });
-        continue;
-      }
-      steps.push({
-        name: exported.name,
-        action: "install",
-        spec: address.spec,
-        enabled: exported.enabled !== false,
-        kind
-      });
-      continue;
-    }
-    const wantEnabled = exported.enabled !== false;
-    if (wantEnabled !== current.selected) {
-      steps.push({ name: exported.name, action: wantEnabled ? "enable" : "disable", kind });
-      continue;
-    }
-    const wanted = (exported.entries ?? []).filter((entry) => entry.enabled !== void 0);
-    const live = entryByName.get(exported.name) ?? [];
-    const changes = input.entries === void 0 ? [] : wanted.map((entry) => {
-      const actual = live.find((row) => row.entryId === entry.entryId);
-      if (actual === void 0 || actual.readOnlyReason !== void 0) return void 0;
-      return actual.enabled === entry.enabled ? void 0 : { entryId: entry.entryId, enabled: entry.enabled };
-    }).filter((row) => row !== void 0);
-    if (changes.length > 0) {
-      steps.push({ name: exported.name, action: "entries", entries: changes, kind });
-      continue;
-    }
-    steps.push({
-      name: exported.name,
-      action: "skip",
-      kind,
-      reason: input.entries === void 0 ? "\u4F9D\u8D56\u4E0E\u542F\u7528\u72B6\u6001\u5DF2\u4E00\u81F4\uFF08\u5BBF\u4E3B\u670D\u52A1\u4E0D\u53EF\u7528\uFF0C\u672A\u6BD4\u5BF9\u6761\u76EE\u5F00\u5173\uFF09" : "\u4F9D\u8D56\u3001\u542F\u7528\u72B6\u6001\u4E0E\u6761\u76EE\u5F00\u5173\u90FD\u5DF2\u4E00\u81F4"
-    });
-  }
-  const changed = [];
-  const exportedSettings = input.bundle.settings;
-  if (exportedSettings !== void 0) {
-    for (const [key, value] of Object.entries(exportedSettings))
-      if (JSON.stringify(input.settings?.[key]) !== JSON.stringify(value))
-        changed.push(key);
-  }
-  const warnings = [...input.bundle.warnings ?? []];
-  if (input.bundle.profile !== void 0 && input.bundle.profile !== input.profileName)
-    warnings.push(
-      `\u5BFC\u51FA\u6587\u4EF6\u6765\u81EA profile\u300C${input.bundle.profile}\u300D\uFF0C\u672C\u673A\u662F\u300C${input.profileName}\u300D\uFF1A\u672C\u5730\u8DEF\u5F84\u5F62\u6001\u53EF\u80FD\u5BF9\u4E0D\u4E0A`
-    );
-  return {
-    source: input.source,
-    ...input.bundle.profile === void 0 ? {} : { exportProfile: input.bundle.profile },
-    ...input.bundle.exportedAt === void 0 ? {} : { exportedAt: input.bundle.exportedAt },
-    steps,
-    settings: { changed },
-    configRows: input.bundle.plugins.reduce((sum, plugin) => sum + (plugin.config?.length ?? 0), 0),
-    unattributedRows: input.bundle.profilePatch?.unattributed?.length ?? 0,
-    omissions: input.bundle.omissions ?? [],
-    warnings
-  };
-}
-function patchSnippet(bundle, profileName) {
-  const rows = [];
-  for (const plugin of bundle.plugins)
-    for (const row of plugin.config ?? [])
-      if (row.config !== void 0 || row.disabled !== void 0) rows.push(row);
-  if (rows.length === 0) return void 0;
-  const header = [
-    `# \u63D2\u4EF6\u6E2F\u6E7E\u5BFC\u51FA\uFF08${bundle.exportedAt ? new Date(bundle.exportedAt).toLocaleString("zh-CN", { hour12: false }) : "\u672A\u77E5\u65F6\u95F4"} \xB7 profile ${bundle.profile ?? "?"}\uFF09`,
-    `# \u8FD9\u4E9B\u884C\u5E26 config\uFF0C\u5BBF\u4E3B\u7684 pluginManager \u6CA1\u6709\u5199 config \u7684\u63A5\u53E3\uFF0C\u9700\u8981\u4F60\u786E\u8BA4\u540E\u81EA\u884C\u7C98\u8D34\u5230`,
-    `# ~/.dsh/profiles/${profileName}/cordis.patch.yml\uFF08profile \u8865\u4E01\u662F YAML \u5E8F\u5217\uFF0C\u5B57\u6BB5\u6309 id \u751F\u6548\uFF09`,
-    "# \u7C98\u8D34\u524D\u8BF7\u6838\u5BF9\uFF1A\u672C\u673A\u63D2\u4EF6\u7248\u672C/\u8DEF\u5F84\u53EF\u80FD\u4E0D\u540C\uFF0Cconfig \u91CC\u7684\u5730\u5740\u3001\u5BC6\u94A5\u7B49\u9700\u8981\u6309\u672C\u673A\u73AF\u5883\u8C03\u6574\u3002",
-    ""
-  ].join("\n");
-  return header + rows.map((row) => serializeRow(row)).join("\n") + "\n";
-}
-function redactRow(row) {
-  const config = row.config === void 0 ? void 0 : redactValue(row.config);
-  const count = config?.count ?? 0;
-  const out = {};
-  if (row.id !== void 0) out.id = row.id;
-  if (row.name !== void 0) out.name = row.name;
-  if (row.disabled !== void 0) out.disabled = row.disabled;
-  if (config !== void 0) out.config = config.value;
-  return { row: out, count };
-}
-function serializeRow(row) {
-  const lines = ["- id: " + JSON.stringify(row.id ?? "")];
-  if (row.name !== void 0) lines.push("  name: " + JSON.stringify(row.name));
-  if (typeof row.disabled === "boolean") lines.push("  disabled: " + String(row.disabled));
-  else if (typeof row.disabled === "string")
-    lines.push("  disabled: !!js " + JSON.stringify(row.disabled));
-  if (row.config !== void 0)
-    lines.push(
-      "  config:",
-      ...JSON.stringify(row.config, null, 2).split("\n").map((line) => "    " + line)
-    );
-  return lines.join("\n");
-}
-function installAddressFor(exported, profileDir, exists = existsSyncSafe) {
-  const source = {
-    name: exported.name,
-    spec: exported.spec,
-    kind: exported.kind,
-    ...exported.packageName === void 0 ? {} : { packageName: exported.packageName }
-  };
-  if (exported.kind === "registry") {
-    const version = exported.version;
-    return {
-      spec: installSpecFor(
-        source,
-        profileDir,
-        version === void 0 || version === "" ? void 0 : version
-      )
-    };
-  }
-  if (exported.kind === "git") return { spec: installSpecFor(source, profileDir) };
-  if (exported.kind === "tarball") {
-    const spec2 = installSpecFor(source, profileDir);
-    if (/^https?:\/\//i.test(spec2)) return { spec: spec2 };
-    const path2 = localPathOf(spec2);
-    if (path2 === void 0) return { spec: spec2 };
-    return exists(path2) ? { spec: spec2 } : {
-      blocked: `\u5BFC\u51FA\u8BB0\u5F55\u7684\u662F\u672C\u673A\u538B\u7F29\u5305\uFF08${path2}\uFF09\uFF0C\u76EE\u6807\u673A\u5668\u4E0A\u6CA1\u6709\u8FD9\u4E2A\u6587\u4EF6\uFF1A\u5148\u628A\u5305\u653E\u8FC7\u53BB\uFF0C\u6216\u6539\u7528 registry / git \u5730\u5740`
-    };
-  }
-  const spec = installSpecFor(source, profileDir);
-  const path = localPathOf(spec);
-  if (path === void 0) return { spec };
-  return exists(path) ? { spec } : {
-    blocked: `\u5BFC\u51FA\u8BB0\u5F55\u7684\u662F\u672C\u673A\u8DEF\u5F84\u5F62\u6001\uFF08${path}\uFF09\uFF0C\u76EE\u6807\u673A\u5668\u4E0A\u6CA1\u6709\u8FD9\u4E2A\u8DEF\u5F84\uFF1A\u5148\u628A\u5305\u653E\u5230\u8BE5\u4F4D\u7F6E\uFF0C\u6216\u6539\u7528 registry / git \u5730\u5740`
-  };
-}
-function localPathOf(spec) {
-  const local = /^(?:file|link):(.+)$/s.exec(spec);
-  if (local) return local[1].replace(/^~(?=$|[\\/])/, () => homedir3());
-  if (/^[A-Za-z]:[\\/]/.test(spec) || spec.startsWith("/") || spec.startsWith("./") || spec.startsWith("../"))
-    return spec;
-  return void 0;
-}
-function existsSyncSafe(path) {
-  try {
-    return statSync(path).isDirectory() || statSync(path).isFile();
-  } catch {
-    return false;
-  }
-}
-function readProfilePatch(profileDir) {
-  let text2;
-  try {
-    text2 = readFileSync2(join3(profileDir, "cordis.patch.yml"), "utf8");
-  } catch (error) {
-    const code = error.code;
-    if (code === "ENOENT") return { rows: [] };
-    return { rows: [], error: error instanceof Error ? error.message : String(error) };
-  }
-  let document;
-  try {
-    document = parseYaml2(text2, {
-      customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value) => value }]
-    });
-  } catch (error) {
-    return { rows: [], error: error instanceof Error ? error.message : String(error) };
-  }
-  if (!Array.isArray(document)) return { rows: [], error: "profile \u8865\u4E01\u4E0D\u662F YAML \u5E8F\u5217" };
-  const rows = [];
-  for (const item of document) {
-    if (!item || typeof item !== "object") continue;
-    const row = item;
-    if (Array.isArray(row.insert)) {
-      for (const inner of row.insert) {
-        if (!inner || typeof inner !== "object") continue;
-        rows.push(normalizeRow(inner));
-      }
-      continue;
-    }
-    rows.push(normalizeRow(row));
-  }
-  return { rows };
-}
-function normalizeRow(row) {
-  const out = {};
-  if (typeof row.id === "string") out.id = row.id;
-  if (typeof row.name === "string") out.name = row.name;
-  if (typeof row.disabled === "boolean") out.disabled = row.disabled;
-  else if (typeof row.disabled === "string") out.disabled = row.disabled;
-  if (row.config !== void 0) out.config = row.config;
-  if (row.insert !== void 0) out.insert = row.insert;
-  return out;
-}
-function declaredRowIds(profileDir, name2) {
-  const dir = pluginDirOf(profileDir, name2);
-  if (dir === void 0) return [];
-  let patchPath;
-  try {
-    const pkg = JSON.parse(readFileSync2(join3(dir, "package.json"), "utf8"));
-    const declared = pkg?.dsh?.bundle?.patch;
-    if (typeof declared === "string") patchPath = resolve2(dir, declared);
-  } catch {
-    return [];
-  }
-  if (patchPath === void 0) return [];
-  let text2;
-  try {
-    text2 = readFileSync2(patchPath, "utf8");
-  } catch {
-    return [];
-  }
-  const ids = [];
-  try {
-    const document = parseYaml2(text2, {
-      customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value) => value }]
-    });
-    if (Array.isArray(document))
-      for (const item of document) {
-        if (!item || typeof item !== "object") continue;
-        const row = item;
-        const list2 = Array.isArray(row.insert) ? row.insert : [row];
-        for (const inner of list2)
-          if (inner && typeof inner === "object" && typeof inner.id === "string")
-            ids.push(inner.id);
-      }
-  } catch {
-    return [];
-  }
-  return [...new Set(ids)];
-}
-function pluginDirOf(profileDir, name2) {
-  const dir = join3(profileDir, "node_modules", name2);
-  try {
-    statSync(dir);
-    return dir;
-  } catch {
-    return void 0;
-  }
-}
-function belongsTo(row, name2, rowIds) {
-  if (row.id !== void 0 && rowIds.includes(row.id)) return true;
-  if (row.name === name2) return true;
-  if (row.name !== void 0 && row.name.startsWith(name2 + "/")) return true;
-  return false;
-}
-function isEntryOf(moduleName, name2) {
-  if (moduleName === name2) return true;
-  return moduleName.startsWith(name2 + "/");
-}
-function dataDirCandidates(profileDir, plugin, entries) {
-  return [
-    .../* @__PURE__ */ new Set([
-      plugin.name,
-      plugin.name.split("/").pop() ?? plugin.name,
-      ...declaredRowIds(profileDir, plugin.name),
-      ...entries.map((entry) => entry.entryId.replace(/^include:/, ""))
-    ])
-  ];
-}
-function collectDataFiles(profileDir, plugin, entries, selfDirName) {
-  const result = { files: [], omissions: [], redactions: 0 };
-  for (const candidate of dataDirCandidates(profileDir, plugin, entries)) {
-    const dir = join3(profileDir, candidate);
-    if (selfDirName !== void 0 && candidate === selfDirName) {
-      result.omissions.push({ path: candidate, reason: "\u672C\u63D2\u4EF6\u81EA\u5DF1\u7684\u6570\u636E\u76EE\u5F55\uFF08\u8BBE\u7F6E\u5DF2\u5355\u72EC\u5BFC\u51FA\uFF09" });
-      continue;
-    }
-    let isDir = false;
-    try {
-      isDir = statSync(dir).isDirectory();
-    } catch {
-      continue;
-    }
-    if (!isDir) continue;
-    let total = 0;
-    walk(dir, candidate, 0, (rel, absolute, size) => {
-      const name2 = basename(absolute);
-      if (EXCLUDED_FILE.test(name2)) {
-        result.omissions.push({ path: rel, reason: "\u6570\u636E\u5E93/\u65E5\u5FD7/\u9501/\u538B\u7F29\u5305\uFF0C\u4E0D\u5BFC\u51FA" });
-        return;
-      }
-      if (!TEXT_EXTENSIONS.has(extname(name2).toLowerCase())) {
-        result.omissions.push({ path: rel, reason: "\u975E\u6587\u672C\u6269\u5C55\u540D\uFF0C\u4E0D\u5BFC\u51FA" });
-        return;
-      }
-      if (size > MAX_FILE_BYTES) {
-        result.omissions.push({ path: rel, reason: `\u8D85\u8FC7 ${Math.round(MAX_FILE_BYTES / 1024)}KB\uFF0C\u4E0D\u5BFC\u51FA` });
-        return;
-      }
-      if (total + size > MAX_TOTAL_BYTES) {
-        result.omissions.push({ path: rel, reason: "\u8D85\u51FA\u672C\u6B21\u5BFC\u51FA\u7684\u603B\u4F53\u79EF\u4E0A\u9650\uFF0C\u4E0D\u5BFC\u51FA" });
-        return;
-      }
-      let text2;
-      try {
-        const raw = readFileSync2(absolute);
-        if (raw.includes(0)) {
-          result.omissions.push({ path: rel, reason: "\u4E8C\u8FDB\u5236\u5185\u5BB9\uFF0C\u4E0D\u5BFC\u51FA" });
-          return;
-        }
-        text2 = raw.toString("utf8");
-      } catch (error) {
-        result.omissions.push({
-          path: rel,
-          reason: "\u8BFB\u53D6\u5931\u8D25\uFF1A" + (error instanceof Error ? error.message : String(error))
-        });
-        return;
-      }
-      const redacted = redactText(text2);
-      if (redacted.count > 0) result.redactions += redacted.count;
-      total += size;
-      result.files.push({ path: rel, bytes: size, content: redacted.text });
-    });
-  }
-  return result;
-}
-function walk(dir, prefix, depth, visit) {
-  if (depth > MAX_DEPTH) return;
-  let items;
-  try {
-    items = readdirSync(dir);
-  } catch {
-    return;
-  }
-  for (const item of items.sort()) {
-    const absolute = join3(dir, item);
-    const rel = prefix + "/" + item;
-    let stats;
-    try {
-      stats = statSync(absolute);
-    } catch {
-      continue;
-    }
-    if (stats.isDirectory()) {
-      if (EXCLUDED_DIRS.has(item.toLowerCase())) continue;
-      walk(absolute, rel, depth + 1, visit);
-      continue;
-    }
-    if (!stats.isFile()) continue;
-    visit(rel, absolute, stats.size);
-  }
-}
-function redactValue(value, key = "") {
-  if (typeof value === "string") {
-    const redacted = redactText(value);
-    if (normalizeKey(key) !== "" && SECRET_KEY.test(normalizeKey(key)))
-      return { value: REDACTED, count: Math.max(1, redacted.count) };
-    return { value: redacted.text, count: redacted.count };
-  }
-  if (Array.isArray(value)) {
-    let count = 0;
-    const out = value.map((item) => {
-      const nested = redactValue(item, key);
-      count += nested.count;
-      return nested.value;
-    });
-    return { value: out, count };
-  }
-  if (value && typeof value === "object") {
-    let count = 0;
-    const out = {};
-    for (const [childKey, childValue] of Object.entries(value)) {
-      const nested = redactValue(childValue, childKey);
-      count += nested.count;
-      out[childKey] = nested.value;
-    }
-    return { value: out, count };
-  }
-  return { value, count: 0 };
-}
-function redactText(text2) {
-  let count = 0;
-  let out = text2;
-  for (const pattern of SECRET_VALUE) {
-    out = out.replace(new RegExp(pattern.source, "gi"), () => {
-      count += 1;
-      return REDACTED;
-    });
-  }
-  return { text: out, count };
-}
-function redactSettings(settings) {
-  const { value } = redactValue(settings);
-  return value;
-}
-function normalizeKey(key) {
-  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-function ownedDataDirNames(profileDir, plugins, entries = [], selfDirName) {
-  const owned = /* @__PURE__ */ new Set();
-  for (const plugin of plugins)
-    for (const name2 of dataDirCandidates(profileDir, plugin, entries)) owned.add(name2);
-  if (selfDirName !== void 0) owned.add(selfDirName);
-  return owned;
-}
-function unownedProfileDirs(profileDir, owned) {
-  let items;
-  try {
-    items = readdirSync(profileDir);
-  } catch {
-    return [];
-  }
-  const out = [];
-  for (const item of items.sort()) {
-    if (owned.has(item)) continue;
-    if (item.startsWith(".")) continue;
-    if (["node_modules", "cache", "logs"].includes(item.toLowerCase())) continue;
-    try {
-      if (!statSync(join3(profileDir, item)).isDirectory()) continue;
-    } catch {
-      continue;
-    }
-    out.push(item);
-  }
-  return out;
 }
 
 // src/core/updates.ts
@@ -1550,8 +2122,8 @@ async function runDiagnostics(deps) {
 }
 
 // src/core/settings.ts
-import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync3, renameSync, writeFileSync } from "node:fs";
-import { dirname, join as join4 } from "node:path";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync4, renameSync as renameSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { dirname, join as join5 } from "node:path";
 var MIN_TTL_MS = 15 * 60 * 1e3;
 var MAX_TTL_MS = 30 * 24 * 3600 * 1e3;
 function defaultSettings() {
@@ -1566,32 +2138,32 @@ function defaultSettings() {
   };
 }
 function settingsPath(dataDir) {
-  return join4(dataDir, "settings.json");
+  return join5(dataDir, "settings.json");
 }
 var isHttpUrl = (value) => /^https?:\/\/[^\s]+$/i.test(value);
 var clean = (value) => value.trim();
 function normalizeSettings(raw, defaults = defaultSettings()) {
   const notes = [];
   const isRecord = raw !== null && typeof raw === "object" && !Array.isArray(raw);
-  const record = isRecord ? raw : {};
+  const record2 = isRecord ? raw : {};
   if (raw !== void 0 && !isRecord)
     notes.push("\u8BBE\u7F6E\u6587\u4EF6\u4E0D\u662F\u5BF9\u8C61\uFF0C\u5DF2\u5168\u90E8\u9000\u56DE\u9ED8\u8BA4\u503C");
-  const locale = record.locale === "en" || record.locale === "zh" ? record.locale : defaults.locale;
-  if (record.locale !== void 0 && record.locale !== locale)
-    notes.push(`locale \u53D6\u503C\u975E\u6CD5\uFF08${String(record.locale)}\uFF09\uFF0C\u5DF2\u9000\u56DE ${locale}`);
+  const locale = record2.locale === "en" || record2.locale === "zh" ? record2.locale : defaults.locale;
+  if (record2.locale !== void 0 && record2.locale !== locale)
+    notes.push(`locale \u53D6\u503C\u975E\u6CD5\uFF08${String(record2.locale)}\uFF09\uFF0C\u5DF2\u9000\u56DE ${locale}`);
   let syncTtlMs = defaults.syncTtlMs;
-  if (typeof record.syncTtlMs === "number" && Number.isFinite(record.syncTtlMs)) {
-    if (record.syncTtlMs >= MIN_TTL_MS && record.syncTtlMs <= MAX_TTL_MS)
-      syncTtlMs = Math.round(record.syncTtlMs);
+  if (typeof record2.syncTtlMs === "number" && Number.isFinite(record2.syncTtlMs)) {
+    if (record2.syncTtlMs >= MIN_TTL_MS && record2.syncTtlMs <= MAX_TTL_MS)
+      syncTtlMs = Math.round(record2.syncTtlMs);
     else
       notes.push(
         `syncTtlMs \u8D85\u51FA\u5141\u8BB8\u533A\u95F4\uFF08${MIN_TTL_MS}\u2013${MAX_TTL_MS}\uFF09\uFF0C\u5DF2\u9000\u56DE ${defaults.syncTtlMs}`
       );
-  } else if (record.syncTtlMs !== void 0) {
+  } else if (record2.syncTtlMs !== void 0) {
     notes.push("syncTtlMs \u4E0D\u662F\u6570\u5B57\uFF0C\u5DF2\u9000\u56DE\u9ED8\u8BA4\u503C");
   }
   const url = (key) => {
-    const value = record[key];
+    const value = record2[key];
     if (typeof value !== "string" || clean(value) === "") {
       if (value !== void 0) notes.push(`${key} \u4E0D\u662F\u5408\u6CD5\u5730\u5740\uFF0C\u5DF2\u9000\u56DE\u9ED8\u8BA4\u503C`);
       return defaults[key];
@@ -1603,7 +2175,7 @@ function normalizeSettings(raw, defaults = defaultSettings()) {
     return clean(value).replace(/\/$/, "");
   };
   let registry = defaults.registry;
-  const registryRaw = record.registry;
+  const registryRaw = record2.registry;
   if (typeof registryRaw === "string") {
     if (clean(registryRaw) === "") registry = "";
     else if (isHttpUrl(clean(registryRaw))) registry = clean(registryRaw).replace(/\/$/, "");
@@ -1612,7 +2184,7 @@ function normalizeSettings(raw, defaults = defaultSettings()) {
     notes.push("registry \u4E0D\u662F\u5B57\u7B26\u4E32\uFF0C\u5DF2\u9000\u56DE\u9ED8\u8BA4\u503C");
   }
   let proxy = defaults.proxy;
-  const proxyRaw = record.proxy;
+  const proxyRaw = record2.proxy;
   if (typeof proxyRaw === "string") {
     if (clean(proxyRaw).length > 200) notes.push("proxy \u8FC7\u957F\uFF08>200\uFF09\uFF0C\u5DF2\u9000\u56DE\u9ED8\u8BA4\u503C");
     else proxy = clean(proxyRaw);
@@ -1636,7 +2208,7 @@ function readSettingsFile(dataDir, defaults = defaultSettings()) {
   const path = settingsPath(dataDir);
   if (!existsSync2(path)) return { settings: defaults, notes: [] };
   try {
-    const parsed = JSON.parse(readFileSync3(path, "utf8"));
+    const parsed = JSON.parse(readFileSync4(path, "utf8"));
     return normalizeSettings(parsed, defaults);
   } catch (error) {
     return {
@@ -1649,10 +2221,10 @@ function readSettingsFile(dataDir, defaults = defaultSettings()) {
 }
 function writeSettingsFile(dataDir, settings) {
   const path = settingsPath(dataDir);
-  mkdirSync(dirname(path), { recursive: true });
+  mkdirSync2(dirname(path), { recursive: true });
   const tmp = path + ".tmp";
-  writeFileSync(tmp, JSON.stringify(settings, null, 2) + "\n", "utf8");
-  renameSync(tmp, path);
+  writeFileSync2(tmp, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  renameSync2(tmp, path);
 }
 function applySettingsPatch(current, patch) {
   const merged = { ...current };
@@ -1758,7 +2330,7 @@ var CatalogStore = class {
 };
 
 // src/upstream/git.ts
-import { spawn } from "node:child_process";
+import { spawn as spawn2 } from "node:child_process";
 var SHA = /^[0-9a-f]{7,40}$/i;
 function parseLsRemote(stdout) {
   const facts = {};
@@ -1784,7 +2356,7 @@ async function readGitVersion(options = {}) {
       clearTimeout(timer);
       resolve4(value);
     };
-    const child = spawn(options.gitPath ?? "git", ["--version"], {
+    const child = spawn2(options.gitPath ?? "git", ["--version"], {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -1821,7 +2393,7 @@ async function readRemoteHead(repo, options = {}) {
       clearTimeout(timer);
       resolve4(facts);
     };
-    const child = spawn(
+    const child = spawn2(
       options.gitPath ?? "git",
       ["ls-remote", "--symref", url, "HEAD"],
       {
@@ -1902,6 +2474,7 @@ var OpQueue = class {
       ...input.restoreSpec !== void 0 ? { restoreSpec: input.restoreSpec } : {},
       ...input.importSteps !== void 0 ? { importSteps: input.importSteps } : {},
       ...input.importCount !== void 0 ? { importCount: input.importCount } : {},
+      ...input.importConfigPlans !== void 0 ? { importConfigPlans: input.importConfigPlans } : {},
       ...input.importSnippetPath !== void 0 ? { importSnippetPath: input.importSnippetPath } : {},
       ...input.note !== void 0 ? { note: input.note } : {}
     };
@@ -2243,7 +2816,7 @@ function isIncompatible(outcome) {
 // src/ops/subprocess.ts
 import { spawn as nodeSpawn } from "node:child_process";
 import { existsSync as existsSync3 } from "node:fs";
-import { dirname as dirname2, join as join5 } from "node:path";
+import { dirname as dirname2, join as join6 } from "node:path";
 var HOST_CLI_RELATIVE = [
   "resources",
   "app.asar",
@@ -2258,7 +2831,7 @@ function hostCliCandidates(execPath) {
   const out = [];
   let dir = dirname2(execPath);
   for (let depth = 0; depth < 4; depth++) {
-    out.push(join5(dir, ...HOST_CLI_RELATIVE));
+    out.push(join6(dir, ...HOST_CLI_RELATIVE));
     const parent = dirname2(dir);
     if (parent === dir) break;
     dir = parent;
@@ -2298,7 +2871,7 @@ function resolveDshCommand(options = {}) {
     for (const dir of pathValue.split(process.platform === "win32" ? ";" : ":")) {
       if (dir.trim() === "") continue;
       for (const extension of extensions) {
-        const candidate = join5(dir.trim(), name2 + extension.toLowerCase());
+        const candidate = join6(dir.trim(), name2 + extension.toLowerCase());
         if (exists(candidate)) return candidate;
       }
     }
@@ -2863,11 +3436,11 @@ function fromManager(outcome) {
 
 // src/ops/watch.ts
 import { existsSync as existsSync4, realpathSync, watch } from "node:fs";
-import { join as join6 } from "node:path";
+import { join as join7 } from "node:path";
 function shouldWatch(packageDir, env = process.env, exists = existsSync4) {
   if (env.PLUGIN_HARBOR_HOT_RELOAD === "0") return false;
-  if (!exists(join6(packageDir, "src", "index.ts"))) return false;
-  return exists(join6(packageDir, "dist"));
+  if (!exists(join7(packageDir, "src", "index.ts"))) return false;
+  return exists(join7(packageDir, "dist"));
 }
 function watchDist(options) {
   const { dir, onChange, filter, logger = console } = options;
@@ -2918,47 +3491,10 @@ function watchDist(options) {
   };
 }
 
-// src/ops/validate.ts
-var NAME = /^[A-Za-z0-9@][A-Za-z0-9@/._-]*$/;
-var SPEC = /^[A-Za-z0-9@.][A-Za-z0-9@/._~:+#=^%\\-]*$/;
-var CONTROL = /[\u0000-\u001f\u007f\s]/;
-function validateName(input) {
-  if (typeof input !== "string") return { ok: false, reason: "\u5305\u540D\u5FC5\u987B\u662F\u5B57\u7B26\u4E32" };
-  const name2 = input.trim();
-  if (name2 === "") return { ok: false, reason: "\u5305\u540D\u4E0D\u80FD\u4E3A\u7A7A" };
-  if (name2.length > 214) return { ok: false, reason: "\u5305\u540D\u8FC7\u957F\uFF08>214\uFF09" };
-  if (CONTROL.test(name2)) return { ok: false, reason: "\u5305\u540D\u542B\u7A7A\u767D\u6216\u63A7\u5236\u5B57\u7B26" };
-  if (name2.startsWith("-") || !NAME.test(name2))
-    return { ok: false, reason: `\u5305\u540D\u4E0D\u5408\u6CD5\uFF1A${name2}` };
-  return { ok: true, value: name2 };
-}
-function validateSpec(input) {
-  if (typeof input !== "string") return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u5FC5\u987B\u662F\u5B57\u7B26\u4E32" };
-  const spec = input.trim();
-  if (spec === "") return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u4E0D\u80FD\u4E3A\u7A7A" };
-  if (spec.length > 300) return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u8FC7\u957F\uFF08>300\uFF09" };
-  if (CONTROL.test(spec)) return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u542B\u7A7A\u767D\u6216\u63A7\u5236\u5B57\u7B26" };
-  if (spec.startsWith("-")) return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u4E0D\u80FD\u4EE5 `-` \u5F00\u5934" };
-  if (/^[\^~*]/.test(spec))
-    return { ok: false, reason: "\u5B89\u88C5\u5730\u5740\u7F3A\u5C11\u5305\u540D\uFF1A\u4E0D\u80FD\u4EE5\u7248\u672C\u8303\u56F4\u5F00\u5934" };
-  if (!SPEC.test(spec)) return { ok: false, reason: `\u5B89\u88C5\u5730\u5740\u542B\u975E\u6CD5\u5B57\u7B26\uFF1A${spec}` };
-  return { ok: true, value: spec };
-}
-function requireConfirm(input) {
-  return input === true ? { ok: true, value: "confirmed" } : { ok: false, reason: "\u8FD9\u4E2A\u64CD\u4F5C\u9700\u8981\u786E\u8BA4\uFF08\u754C\u9762\u4F1A\u5F39\u786E\u8BA4\u6846\uFF09" };
-}
-function validateTaskId(input) {
-  if (typeof input !== "string") return { ok: false, reason: "\u4EFB\u52A1 id \u5FC5\u987B\u662F\u5B57\u7B26\u4E32" };
-  const id = input.trim();
-  if (id === "" || id.length > 120 || CONTROL.test(id))
-    return { ok: false, reason: "\u4EFB\u52A1 id \u4E0D\u5408\u6CD5" };
-  return { ok: true, value: id };
-}
-
 // src/index.ts
 var name = "plugin-harbor";
 var VERSION = "0.1.0-alpha.1";
-var BUILD = true ? "11e857d03cf4" : "dev";
+var BUILD = true ? "9c9f05e7a601" : "dev";
 var SITE_BASE = process.env.PLUGIN_HARBOR_SITE ?? "https://dsh-plugin.org";
 var API_BASE = process.env.PLUGIN_HARBOR_API ?? "https://api.dsh-plugin.org";
 var DEFAULT_REGISTRY2 = process.env.PLUGIN_HARBOR_REGISTRY ?? "";
@@ -2982,7 +3518,7 @@ function selfPackageName(profileDir, entries, moduleDir = dirname3(dirname3(file
       const target = local[2].replace(/^~(?=$|[\\/])/, () => homedir4());
       candidates.push(resolve3(profileDir, target));
     }
-    candidates.push(join7(profileDir, "node_modules", entry.name));
+    candidates.push(join8(profileDir, "node_modules", entry.name));
     for (const candidate of candidates)
       if (realpathOf(candidate) === here) return entry.name;
   }
@@ -3119,6 +3655,32 @@ async function apply(ctx) {
         dependencyPresent: (name2) => readInstalledPlugins(profile.dir).some((plugin) => plugin.name === name2),
         ...settings.registry !== "" ? { registry: settings.registry } : {}
       });
+      if (task.importConfigPlans) {
+        const plans = task.importConfigPlans;
+        const applicable = plans.filter((p) => p.action === "apply");
+        let applied = 0;
+        let failed = 0;
+        if (result.status === "done") {
+          for (const plan of applicable) {
+            if (control.cancelled) break;
+            try {
+              const local = readInstalledPlugins(profile.dir).find((p) => p.name === plan.plugin);
+              if (!local || local.kind === "path") throw Error("\u63D2\u4EF6\u5B89\u88C5\u6765\u6E90\u5DF2\u53D8\u5316");
+              await applyConfig(plan, ctx.get?.("configEditor"));
+              applied++;
+              control.log(`${plan.plugin} \u914D\u7F6E ${plan.id}\uFF1A\u5DF2\u7531\u5BBF\u4E3B\u5408\u5E76 ${plan.paths.length} \u4E2A\u5B57\u6BB5`);
+            } catch {
+              failed++;
+              control.log(`${plan.plugin} \u914D\u7F6E ${plan.id}\uFF1A\u672A\u5E94\u7528\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0\uFF08\u6761\u76EE\u3001\u914D\u7F6E\u6216\u5BBF\u4E3B\u6821\u9A8C\u5DF2\u53D8\u5316\uFF09`);
+            }
+          }
+        }
+        const summary = `\u914D\u7F6E\uFF1A\u81EA\u52A8\u5E94\u7528 ${applied}\u3001\u5F85\u4EBA\u5DE5 ${plans.filter((p) => p.action === "manual").length}\u3001\u4FDD\u7559 ${plans.filter((p) => p.action === "skip").length}\u3001\u672A\u5E94\u7528 ${applicable.length - applied}`;
+        const note = appendNote(result.note, summary);
+        if (control.cancelled) return { ...result, status: "cancelled", note };
+        if (failed) return { ...result, status: "failed", note, error: "\u90E8\u5206\u914D\u7F6E\u672A\u5E94\u7528\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0" };
+        return { ...result, note };
+      }
       if (task.kind !== "update") return result;
       const present = readInstalledPlugins(profile.dir).some(
         (plugin) => plugin.name === task.target
@@ -3146,7 +3708,7 @@ async function apply(ctx) {
       }
     }
   );
-  const uploadsDir = () => join7(profile.dataDir, "exports");
+  const uploadsDir = () => join8(profile.dataDir, "exports");
   const MAX_EXPORT_BYTES = 8 * 1024 * 1024;
   const resolveExportPath = (input) => {
     if (typeof input !== "string") throw Error("\u5BFC\u5165\u6587\u4EF6\u8DEF\u5F84\u5FC5\u987B\u662F\u5B57\u7B26\u4E32");
@@ -3154,7 +3716,7 @@ async function apply(ctx) {
     if (raw === "") throw Error("\u5BFC\u5165\u6587\u4EF6\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A");
     if (raw.length > 4096 || /[\u0000-\u001f\u007f]/.test(raw))
       throw Error("\u5BFC\u5165\u6587\u4EF6\u8DEF\u5F84\u4E0D\u5408\u6CD5\uFF08\u542B\u63A7\u5236\u5B57\u7B26\u6216\u8FC7\u957F\uFF09");
-    return isAbsolute2(raw) ? raw : join7(uploadsDir(), raw);
+    return isAbsolute3(raw) ? raw : join8(uploadsDir(), raw);
   };
   const saveUploaded = (payload) => {
     const raw = payload?.content;
@@ -3170,9 +3732,9 @@ async function apply(ctx) {
     const suffix = base.replace(/^.*[\\/]/, "").replace(/\.json$/i, "").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.-]+/, "").slice(0, 80);
     const stamp = exportFileName(profile.name, Date.now()).replace(/\.json$/, "");
     const name2 = suffix === "" ? `${stamp}.json` : `${stamp}-${suffix}.json`;
-    const path = join7(uploadsDir(), name2);
-    mkdirSync2(dirname3(path), { recursive: true });
-    writeFileSync2(path, text2, "utf8");
+    const path = join8(uploadsDir(), name2);
+    mkdirSync3(dirname3(path), { recursive: true });
+    writeFileSync3(path, text2, "utf8");
     log(`\u5BFC\u5165\u6587\u4EF6\u5DF2\u5B58\u5165 ${path}\uFF08${bytes} \u5B57\u8282\uFF09`);
     return { name: name2, path, bytes };
   };
@@ -3186,10 +3748,10 @@ async function apply(ctx) {
     if (!stats.isFile()) throw Error("\u8FD9\u4E0D\u662F\u4E00\u4E2A\u6587\u4EF6\uFF1A" + path);
     if (stats.size > MAX_EXPORT_BYTES)
       throw Error(`\u6587\u4EF6\u6709 ${stats.size} \u5B57\u8282\uFF0C\u8D85\u8FC7 ${MAX_EXPORT_BYTES} \u4E0A\u9650\uFF1A\u4E0D\u662F\u63D2\u4EF6\u6E2F\u6E7E\u7684\u5BFC\u51FA\u6587\u4EF6\uFF1F`);
-    const parsed = readExport(readFileSync4(path, "utf8"));
+    const parsed = readExport(readFileSync5(path, "utf8"));
     if (parsed.bundle === void 0)
       throw Error(`\u8FD9\u4E2A\u6587\u4EF6\u4E0D\u80FD\u4F5C\u4E3A\u5BFC\u5165\u6E90\uFF1A${parsed.error}`);
-    return { bundle: parsed.bundle, source: path };
+    return { bundle: classifyExport(parsed.bundle, profile.dir), source: path };
   };
   const countSteps = (steps) => {
     const counts = { install: 0, enable: 0, disable: 0, entries: 0, skip: 0, blocked: 0 };
@@ -3197,7 +3759,123 @@ async function apply(ctx) {
     return counts;
   };
   const describePlanCounts = (counts) => `\u8BA1\u5212\uFF1A\u5B89\u88C5 ${counts.install}\u3001\u542F\u7528 ${counts.enable}\u3001\u505C\u7528 ${counts.disable}\u3001\u6062\u590D\u6761\u76EE\u5F00\u5173 ${counts.entries}\u3001\u5DF2\u4E00\u81F4 ${counts.skip}\u3001\u65E0\u6CD5\u5904\u7406 ${counts.blocked}`;
+  const gitSync = new GitSync(join8(profile.dataDir, "git-sync"));
+  const syncImportConfigs = /* @__PURE__ */ new Map();
+  const syncPlans = /* @__PURE__ */ new Map();
+  const captureSync = async () => {
+    const entries = manager ? await readHostEntries(manager) : void 0;
+    const bundle = buildExport({
+      profileName: profile.name,
+      profileDir: profile.dir,
+      pluginVersion: VERSION,
+      plugins: readInstalledPlugins(profile.dir),
+      settings,
+      ...entries === void 0 ? {} : { entries },
+      includeData: false,
+      selfDirName: "plugin-harbor"
+    });
+    delete bundle.settings;
+    bundle.omissions.push(
+      { path: "settings", reason: "\u6E2F\u6E7E\u8BBE\u7F6E\u3001\u540C\u6B65\u4ED3\u5E93\u4E0E\u8BA4\u8BC1\u7559\u5728\u672C\u673A" },
+      { path: "plugin-data", reason: "\u9996\u7248\u4E0D\u53D1\u5E03\u5404\u63D2\u4EF6\u7684\u6570\u636E\u6587\u4EF6\uFF1B\u8BF7\u4F7F\u7528\u5BFC\u51FA\u529F\u80FD\u5355\u72EC\u643A\u5E26" }
+    );
+    const text2 = snapshot(portableBundle(bundle));
+    parseSnapshot(text2);
+    return text2;
+  };
+  const checkedSyncPlan = async (payload) => {
+    const plan = syncPlans.get(payload?.token);
+    if (!plan || Date.now() - plan.at > 15 * 6e4) throw Error("\u540C\u6B65\u9884\u68C0\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u8FDC\u7AEF");
+    if (plan.config !== JSON.stringify(gitSync.config()) || plan.local !== await captureSync())
+      throw Error("\u672C\u673A\u73AF\u5883\u6216\u540C\u6B65\u8BBE\u7F6E\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u8FDC\u7AEF");
+    return plan;
+  };
   const opHandlers = {
+    "sync.get": async () => ({ config: gitSync.config(), branch: BRANCH }),
+    "sync.configure": async (payload) => {
+      const confirmed = requireConfirm(payload?.confirm);
+      if (!confirmed.ok) throw Error(confirmed.reason);
+      const config = gitSync.configure(payload);
+      syncPlans.clear();
+      return { config, branch: BRANCH };
+    },
+    "sync.cancel": async () => gitSync.cancel(),
+    "sync.preview": async () => gitSync.locked(async () => {
+      if (!queue.isIdle()) throw Error("\u8BF7\u7B49\u5F85\u63D2\u4EF6\u64CD\u4F5C\u7ED3\u675F\u540E\u518D\u9884\u68C0");
+      const local = await captureSync();
+      const remote = await gitSync.inspect();
+      const entries = manager ? await readHostEntries(manager) : void 0;
+      const bundle = remote.text === null ? void 0 : portableBundle(classifyExport(parseSnapshot(remote.text), profile.dir), readInstalledPlugins(profile.dir));
+      const plan = bundle ? planImport({
+        source: `Git ${remote.commit}`,
+        bundle,
+        profileName: profile.name,
+        profileDir: profile.dir,
+        installed: readInstalledPlugins(profile.dir),
+        settings,
+        ...entries === void 0 ? {} : { entries }
+      }) : void 0;
+      const versions = bundle?.plugins.flatMap((p) => {
+        const installed = readInstalledPlugins(profile.dir).find((x) => x.name === p.name);
+        return installed && (installed.version !== p.version || installed.spec !== p.spec) ? [`${p.name}\uFF1A\u5B89\u88C5\u6765\u6E90\u6216\u7248\u672C\u4E0D\u540C\uFF0C\u9996\u7248\u4FDD\u7559\u672C\u673A\u7248\u672C`] : [];
+      }) ?? [];
+      const publish = snapshot(publicationBundle(parseSnapshot(local), remote.text === null ? void 0 : parseSnapshot(remote.text), readInstalledPlugins(profile.dir)));
+      const configPlans = bundle ? planConfigs(bundle, ctx.get?.("configEditor")) : [];
+      const manualBundle = bundle ? structuredClone(bundle) : void 0;
+      if (manualBundle) for (const plugin of manualBundle.plugins) plugin.config = (plugin.config ?? []).filter((row) => configPlans.some((p) => p.plugin === plugin.name && p.id === (row.id ?? "") && p.action === "manual"));
+      const token = randomUUID2();
+      syncPlans.clear();
+      syncPlans.set(token, { configPlans, config: JSON.stringify(gitSync.config()), local, publish, remote: remote.text, commit: remote.commit, at: Date.now() });
+      const exported = parseSnapshot(publish);
+      return {
+        token,
+        configPlans,
+        commit: remote.commit,
+        history: remote.history,
+        plan,
+        versions,
+        local: {
+          plugins: exported.plugins.map((p) => ({ name: p.name, version: p.version, enabled: p.enabled })),
+          snapshot: publish,
+          configRows: exported.plugins.reduce((n, p) => n + (p.config?.length ?? 0), 0),
+          omissions: exported.omissions,
+          warnings: exported.warnings
+        },
+        hasRemote: !!bundle,
+        same: remote.text !== null && digest(snapshot(bundle)) === digest(local),
+        snippet: manualBundle ? patchSnippet(manualBundle, profile.name) : void 0
+      };
+    }),
+    "sync.publish": async (payload) => gitSync.locked(async () => {
+      const confirmed = requireConfirm(payload?.confirm);
+      if (!confirmed.ok) throw Error(confirmed.reason);
+      if (!queue.isIdle()) throw Error("\u8BF7\u7B49\u5F85\u63D2\u4EF6\u64CD\u4F5C\u7ED3\u675F");
+      const plan = await checkedSyncPlan(payload);
+      const result = await gitSync.publish(plan.publish, plan.commit);
+      syncPlans.clear();
+      return result;
+    }),
+    "sync.apply": async (payload) => gitSync.locked(async () => {
+      const confirmed = requireConfirm(payload?.confirm);
+      if (!confirmed.ok) throw Error(confirmed.reason);
+      if (!queue.isIdle()) throw Error("\u8BF7\u7B49\u5F85\u63D2\u4EF6\u64CD\u4F5C\u7ED3\u675F");
+      const plan = await checkedSyncPlan(payload);
+      if (!plan.remote) throw Error("\u8FDC\u7AEF\u5C1A\u65E0\u73AF\u5883\u5FEB\u7167");
+      const bundle = portableBundle(classifyExport(parseSnapshot(plan.remote), profile.dir), readInstalledPlugins(profile.dir));
+      const configs = planConfigs(bundle, ctx.get?.("configEditor"));
+      if (JSON.stringify(configs) !== JSON.stringify(plan.configPlans)) throw Error("\u672C\u673A\u914D\u7F6E\u6216\u5BBF\u4E3B\u914D\u7F6E\u80FD\u529B\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+      delete bundle.settings;
+      const path = join8(uploadsDir(), `git-${digest(plan.remote)}.json`);
+      mkdirSync3(uploadsDir(), { recursive: true });
+      writeFileSync3(path, serializeExport(bundle), "utf8");
+      syncPlans.clear();
+      syncImportConfigs.set(path, configs);
+      try {
+        return await opHandlers["op.import"]({ path, confirm: true });
+      } finally {
+        syncImportConfigs.delete(path);
+      }
+    }),
     /** 当前设置 + 读取时的修正说明（界面要能看见「哪一项被退回了默认值」）。 */
     "settings.get": async () => ({
       ...settings,
@@ -3241,13 +3919,13 @@ async function apply(ctx) {
       const hit = cached?.details?.find(([key]) => key === repo)?.[1];
       if (hit && Date.now() - hit.at < DETAIL_TTL_MS)
         return hit.record;
-      const record = await fetchDetail(
+      const record2 = await fetchDetail(
         { fetch: fetchText, siteBase: settings.siteBase, locale: settings.locale },
         repo
       );
-      if (!record) return null;
-      await rpcContext.store.call("catalog.putDetail", { repo, record });
-      return record;
+      if (!record2) return null;
+      await rpcContext.store.call("catalog.putDetail", { repo, record: record2 });
+      return record2;
     },
     /**
      * 连通性诊断：**只读**，且只在用户点「运行诊断」时跑（其中几项要出网）。
@@ -3359,7 +4037,7 @@ async function apply(ctx) {
       const out = [];
       for (const name2 of readdirSync2(dir).sort().reverse()) {
         if (!name2.endsWith(".json")) continue;
-        const path = join7(dir, name2);
+        const path = join8(dir, name2);
         try {
           const stats = statSync2(path);
           if (!stats.isFile()) continue;
@@ -3389,9 +4067,9 @@ async function apply(ctx) {
         now
       });
       const name2 = exportFileName(profile.name, now);
-      const path = join7(uploadsDir(), name2);
-      mkdirSync2(dirname3(path), { recursive: true });
-      writeFileSync2(path, serializeExport(bundle), "utf8");
+      const path = join8(uploadsDir(), name2);
+      mkdirSync3(dirname3(path), { recursive: true });
+      writeFileSync3(path, serializeExport(bundle), "utf8");
       const bytes = statSync2(path).size;
       log(`\u5BFC\u51FA ${plugins.length} \u4E2A\u63D2\u4EF6 \u2192 ${path}\uFF08${bytes} \u5B57\u8282\uFF09`);
       return {
@@ -3433,6 +4111,7 @@ async function apply(ctx) {
       if (!confirmed.ok) throw Error(confirmed.reason);
       const path = resolveExportPath(payload?.path);
       const { bundle, source } = loadExport(path);
+      const configPlans = syncImportConfigs.get(path);
       const entries = manager ? await readHostEntries(manager) : void 0;
       const plan = planImport({
         source,
@@ -3454,11 +4133,13 @@ async function apply(ctx) {
         steps.push(step);
       }
       let snippetPath;
-      const snippet = patchSnippet(bundle, profile.name);
+      const manualBundle = structuredClone(bundle);
+      if (configPlans) for (const plugin of manualBundle.plugins) plugin.config = (plugin.config ?? []).filter((row) => configPlans.some((p) => p.plugin === plugin.name && p.id === (row.id ?? "") && p.action === "manual"));
+      const snippet = patchSnippet(manualBundle, profile.name);
       if (snippet !== void 0) {
-        snippetPath = join7(uploadsDir(), `${exportFileName(profile.name, Date.now()).replace(/\.json$/, "")}-patch.yml`);
-        mkdirSync2(dirname3(snippetPath), { recursive: true });
-        writeFileSync2(snippetPath, snippet, "utf8");
+        snippetPath = join8(uploadsDir(), `${exportFileName(profile.name, Date.now()).replace(/\.json$/, "")}-patch.yml`);
+        mkdirSync3(dirname3(snippetPath), { recursive: true });
+        writeFileSync3(snippetPath, snippet, "utf8");
         log(`\u5BFC\u5165\u7684\u914D\u7F6E\u7247\u6BB5\u5DF2\u5199\u5230 ${snippetPath}\uFF08\u9700\u8981\u4EBA\u5DE5\u7C98\u8D34\uFF0C\u5BBF\u4E3B\u6CA1\u6709\u5199 config \u7684\u63A5\u53E3\uFF09`);
       }
       const counts = countSteps(steps);
@@ -3467,6 +4148,7 @@ async function apply(ctx) {
         target: path,
         importSteps: steps,
         importCount: plan.steps.length,
+        ...configPlans === void 0 ? {} : { importConfigPlans: configPlans },
         ...snippetPath === void 0 ? {} : { importSnippetPath: snippetPath },
         note: describePlanCounts(counts)
       });
@@ -3626,7 +4308,7 @@ async function apply(ctx) {
   let stopWatch;
   const packageDir = dirname3(dirname3(fileURLToPath(import.meta.url)));
   if (shouldWatch(packageDir)) {
-    const distDir = join7(packageDir, "dist");
+    const distDir = join8(packageDir, "dist");
     let reloading = false;
     let queued = false;
     const reloadFromDisk = () => {

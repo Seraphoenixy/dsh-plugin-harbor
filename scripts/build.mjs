@@ -1,7 +1,13 @@
-import { build } from "esbuild";
-import { mkdir, readdir, readFile } from "node:fs/promises";
+import { build as bundle } from "esbuild";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+
+// 由 Node 写出生成物，避免 Windows 环境对 esbuild 子进程直接写文件的限制。
+async function build(options) {
+  const result = await bundle({ ...options, write: false });
+  for (const file of result.outputFiles) await writeFile(file.path, file.contents);
+}
 
 const sourcemap = process.env.PLUGIN_HARBOR_SOURCEMAPS === "1";
 await mkdir("dist", { recursive: true });

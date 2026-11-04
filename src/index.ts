@@ -1,3 +1,6 @@
+import { planConfigs, applyConfig, type ConfigPlan, type ConfigEditorLike } from "./git-sync/config.ts";
+import { GitSync, BRANCH, snapshot, digest, parseSnapshot, portableBundle, publicationBundle } from "./git-sync/service.ts";
+import { randomUUID } from "node:crypto";
 /**
  * 插件港湾宿主入口。
  *
@@ -23,6 +26,7 @@ import { fetchDetail, syncCatalog, type SyncReport } from "./core/catalog.ts";
 import { readInstalledPlugins } from "./core/installed.ts";
 import {
   buildExport,
+  classifyExport,
   exportFileName,
   patchSnippet,
   planImport,
@@ -303,6 +307,27 @@ export async function apply(ctx: any) {
        *
        * 复查失败不能把一次成功的更新改判成失败：只把原因追加进结论与日志。
        */
+      if (task.importConfigPlans) {
+        const plans = task.importConfigPlans;
+        const applicable = plans.filter(p => p.action === "apply");
+        let applied = 0; let failed = 0;
+        if (result.status === "done") {
+          for (const plan of applicable) {
+            if (control.cancelled) break;
+            try {
+              const local = readInstalledPlugins(profile.dir).find(p => p.name === plan.plugin);
+              if (!local || local.kind === "path") throw Error("插件安装来源已变化");
+              await applyConfig(plan, ctx.get?.("configEditor") as ConfigEditorLike | undefined);
+              applied++; control.log(`${plan.plugin} 配置 ${plan.id}：已由宿主合并 ${plan.paths.length} 个字段`);
+            } catch { failed++; control.log(`${plan.plugin} 配置 ${plan.id}：未应用，请重新预检（条目、配置或宿主校验已变化）`); }
+          }
+        }
+        const summary = `配置：自动应用 ${applied}、待人工 ${plans.filter(p => p.action === "manual").length}、保留 ${plans.filter(p => p.action === "skip").length}、未应用 ${applicable.length - applied}`;
+        const note = appendNote(result.note, summary);
+        if (control.cancelled) return { ...result, status: "cancelled" as const, note };
+        if (failed) return { ...result, status: "failed" as const, note, error: "部分配置未应用，请重新预检" };
+        return { ...result, note };
+      }
       if (task.kind !== "update") return result;
       const present = readInstalledPlugins(profile.dir).some(
         (plugin) => plugin.name === task.target,
@@ -414,7 +439,7 @@ export async function apply(ctx: any) {
     const parsed = readExport(readFileSync(path, "utf8"));
     if (parsed.bundle === undefined)
       throw Error(`这个文件不能作为导入源：${parsed.error}`);
-    return { bundle: parsed.bundle, source: path };
+    return { bundle: classifyExport(parsed.bundle, profile.dir), source: path };
   };
 
   const countSteps = (steps: OpTask["importSteps"]) => {
@@ -427,7 +452,84 @@ export async function apply(ctx: any) {
     `计划：安装 ${counts.install}、启用 ${counts.enable}、停用 ${counts.disable}、恢复条目开关 ${counts.entries}` +
     `、已一致 ${counts.skip}、无法处理 ${counts.blocked}`;
 
+  const gitSync = new GitSync(join(profile.dataDir, "git-sync"));
+  const syncImportConfigs = new Map<string, ConfigPlan[]>();
+  const syncPlans = new Map<string, { configPlans: ConfigPlan[]; config: string; local: string; publish: string; remote: string | null; commit: string | null; at: number }>();
+  const captureSync = async () => {
+    const entries = manager ? await readHostEntries(manager) : undefined;
+    const bundle = buildExport({ profileName: profile.name, profileDir: profile.dir,
+      pluginVersion: VERSION, plugins: readInstalledPlugins(profile.dir), settings,
+      ...(entries === undefined ? {} : { entries }), includeData: false, selfDirName: "plugin-harbor" });
+    // 代理、registry 等设置属于本机；通用配置不能由本插件写回。
+    delete bundle.settings;
+    bundle.omissions.push({ path: "settings", reason: "港湾设置、同步仓库与认证留在本机" },
+      { path: "plugin-data", reason: "首版不发布各插件的数据文件；请使用导出功能单独携带" });
+    const text = snapshot(portableBundle(bundle)); parseSnapshot(text); return text;
+  };
+  const checkedSyncPlan = async (payload: any) => {
+    const plan = syncPlans.get(payload?.token);
+    if (!plan || Date.now() - plan.at > 15 * 60_000) throw Error("同步预检已过期，请重新检查远端");
+    if (plan.config !== JSON.stringify(gitSync.config()) || plan.local !== await captureSync())
+      throw Error("本机环境或同步设置已变化，请重新检查远端");
+    return plan;
+  };
+
   const opHandlers = {
+    "sync.get": async () => ({ config: gitSync.config(), branch: BRANCH }),
+    "sync.configure": async (payload: any) => {
+      const confirmed = requireConfirm(payload?.confirm); if (!confirmed.ok) throw Error(confirmed.reason);
+      const config = gitSync.configure(payload); syncPlans.clear(); return { config, branch: BRANCH };
+    },
+    "sync.cancel": async () => gitSync.cancel(),
+    "sync.preview": async () => gitSync.locked(async () => {
+      if (!queue.isIdle()) throw Error("请等待插件操作结束后再预检");
+      const local = await captureSync();
+      const remote = await gitSync.inspect();
+      const entries = manager ? await readHostEntries(manager) : undefined;
+      const bundle = remote.text === null ? undefined : portableBundle(classifyExport(parseSnapshot(remote.text), profile.dir), readInstalledPlugins(profile.dir));
+      const plan = bundle ? planImport({ source: `Git ${remote.commit}`, bundle,
+        profileName: profile.name, profileDir: profile.dir, installed: readInstalledPlugins(profile.dir),
+        settings, ...(entries === undefined ? {} : { entries }) }) : undefined;
+      const versions = bundle?.plugins.flatMap(p => {
+        const installed = readInstalledPlugins(profile.dir).find(x => x.name === p.name);
+        return installed && (installed.version !== p.version || installed.spec !== p.spec)
+          ? [`${p.name}：安装来源或版本不同，首版保留本机版本`] : [];
+      }) ?? [];
+      const publish = snapshot(publicationBundle(parseSnapshot(local), remote.text === null ? undefined : parseSnapshot(remote.text), readInstalledPlugins(profile.dir)));
+      const configPlans = bundle ? planConfigs(bundle, ctx.get?.("configEditor") as ConfigEditorLike | undefined) : [];
+      const manualBundle = bundle ? structuredClone(bundle) : undefined;
+      if (manualBundle) for (const plugin of manualBundle.plugins) plugin.config = (plugin.config ?? []).filter(row => configPlans.some(p => p.plugin === plugin.name && p.id === (row.id ?? "") && p.action === "manual"));
+      const token = randomUUID(); syncPlans.clear();
+      syncPlans.set(token, { configPlans, config: JSON.stringify(gitSync.config()), local, publish, remote: remote.text, commit: remote.commit, at: Date.now() });
+      const exported = parseSnapshot(publish);
+      return { token, configPlans, commit: remote.commit, history: remote.history, plan, versions,
+        local: { plugins: exported.plugins.map(p => ({ name: p.name, version: p.version, enabled: p.enabled })),
+          snapshot: publish, configRows: exported.plugins.reduce((n, p) => n + (p.config?.length ?? 0), 0), omissions: exported.omissions, warnings: exported.warnings },
+        hasRemote: !!bundle, same: remote.text !== null && digest(snapshot(bundle!)) === digest(local),
+        snippet: manualBundle ? patchSnippet(manualBundle, profile.name) : undefined };
+    }),
+    "sync.publish": async (payload: any) => gitSync.locked(async () => {
+      const confirmed = requireConfirm(payload?.confirm); if (!confirmed.ok) throw Error(confirmed.reason);
+      if (!queue.isIdle()) throw Error("请等待插件操作结束");
+      const plan = await checkedSyncPlan(payload);
+      const result = await gitSync.publish(plan.publish, plan.commit); syncPlans.clear(); return result;
+    }),
+    "sync.apply": async (payload: any): Promise<OpTask> => gitSync.locked(async () => {
+      const confirmed = requireConfirm(payload?.confirm); if (!confirmed.ok) throw Error(confirmed.reason);
+      if (!queue.isIdle()) throw Error("请等待插件操作结束");
+      const plan = await checkedSyncPlan(payload); if (!plan.remote) throw Error("远端尚无环境快照");
+      const bundle = portableBundle(classifyExport(parseSnapshot(plan.remote), profile.dir), readInstalledPlugins(profile.dir));
+      const configs = planConfigs(bundle, ctx.get?.("configEditor") as ConfigEditorLike | undefined);
+      if (JSON.stringify(configs) !== JSON.stringify(plan.configPlans)) throw Error("本机配置或宿主配置能力已变化，请重新预检");
+      // 远端永远不能替换本机的 registry、代理或同步设置。
+      delete bundle.settings;
+      const path = join(uploadsDir(), `git-${digest(plan.remote)}.json`);
+      mkdirSync(uploadsDir(), { recursive: true }); writeFileSync(path, serializeExport(bundle), "utf8");
+      syncPlans.clear();
+      syncImportConfigs.set(path, configs);
+      try { return await opHandlers["op.import"]({ path, confirm: true }); }
+      finally { syncImportConfigs.delete(path); }
+    }),
     /** 当前设置 + 读取时的修正说明（界面要能看见「哪一项被退回了默认值」）。 */
     "settings.get": async (): Promise<CenterSettings> => ({
       ...settings,
@@ -673,6 +775,7 @@ export async function apply(ctx: any) {
       if (!confirmed.ok) throw Error(confirmed.reason);
       const path = resolveExportPath(payload?.path);
       const { bundle, source } = loadExport(path);
+      const configPlans = syncImportConfigs.get(path);
       const entries = manager ? await readHostEntries(manager) : undefined;
       const plan = planImport({
         source,
@@ -698,7 +801,9 @@ export async function apply(ctx: any) {
        * 先把片段写到文件里，路径随任务结论一起给用户，省得他自己拼 YAML。
        */
       let snippetPath: string | undefined;
-      const snippet = patchSnippet(bundle, profile.name);
+      const manualBundle = structuredClone(bundle);
+      if (configPlans) for (const plugin of manualBundle.plugins) plugin.config = (plugin.config ?? []).filter(row => configPlans.some(p => p.plugin === plugin.name && p.id === (row.id ?? "") && p.action === "manual"));
+      const snippet = patchSnippet(manualBundle, profile.name);
       if (snippet !== undefined) {
         snippetPath = join(uploadsDir(), `${exportFileName(profile.name, Date.now()).replace(/\.json$/, "")}-patch.yml`);
         mkdirSync(dirname(snippetPath), { recursive: true });
@@ -711,6 +816,7 @@ export async function apply(ctx: any) {
         target: path,
         importSteps: steps,
         importCount: plan.steps.length,
+        ...(configPlans === undefined ? {} : { importConfigPlans: configPlans }),
         ...(snippetPath === undefined ? {} : { importSnippetPath: snippetPath }),
         note: describePlanCounts(counts),
       });

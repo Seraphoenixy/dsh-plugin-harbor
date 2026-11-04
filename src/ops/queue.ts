@@ -66,6 +66,7 @@ export class OpQueue {
     /** 导入计划（服务端算好；客户端无权提供）。 */
     importSteps?: OpTask["importSteps"];
     importCount?: number;
+    importConfigPlans?: OpTask["importConfigPlans"];
     importSnippetPath?: string;
     /** 入队时就写进任务的一句话（运行中界面可见；终态由运行器给的那句覆盖）。 */
     note?: string;
@@ -83,6 +84,7 @@ export class OpQueue {
       ...(input.restoreSpec !== undefined ? { restoreSpec: input.restoreSpec } : {}),
       ...(input.importSteps !== undefined ? { importSteps: input.importSteps } : {}),
       ...(input.importCount !== undefined ? { importCount: input.importCount } : {}),
+      ...(input.importConfigPlans !== undefined ? { importConfigPlans: input.importConfigPlans } : {}),
       ...(input.importSnippetPath !== undefined ? { importSnippetPath: input.importSnippetPath } : {}),
       ...(input.note !== undefined ? { note: input.note } : {}),
     };
