@@ -193,9 +193,16 @@ window.__ModuleLoader__.load({
       const live = tasks.filter(
         (task: any) => task.status === "queued" || task.status === "running",
       );
-      const finished = tasks.filter(
-        (task: any) => task.status !== "queued" && task.status !== "running",
-      );
+      // 已完成的记录按结束时间从新到旧排（与下方跨重启历史一致，缺结束时间的按入队时间）；
+      // 「进行中」保持队列顺序不动 —— 那是执行顺序，不是记录。
+      const finished = tasks
+        .filter(
+          (task: any) => task.status !== "queued" && task.status !== "running",
+        )
+        .sort(
+          (a: any, b: any) =>
+            (b.endedAt ?? b.queuedAt ?? 0) - (a.endedAt ?? a.queuedAt ?? 0),
+        );
       return h(
         "div",
         { className: "pc-market" },

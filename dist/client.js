@@ -12,7 +12,7 @@
       const { useCallback, useEffect, useRef, useState } = React;
       const PANEL_ID = "plugin-harbor";
       const LABEL = "\u63D2\u4EF6\u6E2F\u6E7E";
-      const BUILD = true ? "9c9f05e7a601" : "dev";
+      const BUILD = true ? "00cf985b5e4b" : "dev";
       globalThis.__PLUGIN_HARBOR_BUILD__ = BUILD;
       const TABS = [
         { id: "market", label: "\u5E02\u573A" },
@@ -134,6 +134,8 @@
         );
         const finished = tasks.filter(
           (task) => task.status !== "queued" && task.status !== "running"
+        ).sort(
+          (a, b) => (b.endedAt ?? b.queuedAt ?? 0) - (a.endedAt ?? a.queuedAt ?? 0)
         );
         return h(
           "div",

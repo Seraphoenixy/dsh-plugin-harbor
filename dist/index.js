@@ -3494,7 +3494,7 @@ function watchDist(options) {
 // src/index.ts
 var name = "plugin-harbor";
 var VERSION = "0.1.0-alpha.1";
-var BUILD = true ? "9c9f05e7a601" : "dev";
+var BUILD = true ? "00cf985b5e4b" : "dev";
 var SITE_BASE = process.env.PLUGIN_HARBOR_SITE ?? "https://dsh-plugin.org";
 var API_BASE = process.env.PLUGIN_HARBOR_API ?? "https://api.dsh-plugin.org";
 var DEFAULT_REGISTRY2 = process.env.PLUGIN_HARBOR_REGISTRY ?? "";

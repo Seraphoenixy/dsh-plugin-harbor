@@ -13,7 +13,7 @@
 - `index.ts`：解析 profile 路径 → 装配目录库 worker → 用 `connection.fetch.register` 挂载 `/api/plugin-harbor` → 暴露 `dispatch` 供契约测试。`apply` 返回带 `stop`/`dispatch` 的可调用对象。
 - `core/dispatch.ts`：版本化 RPC 信封（`{type:'client-request', method:'plugin-harbor', rpcId, payload:{version:1, method, payload}}`）的校验、分发与错误脱敏。信封校验先于一切业务处理。
 - `core/paths.ts`：`DSH_HOME` / profile 解析；profile 名过白名单正则（会被拼进文件路径）。
-- `storage/worker.ts`：SQLite（`node:sqlite`，WAL + busy_timeout）。M0 只有 `ping`/`close`；M1 加目录表、FTS5 与增量同步。
+- `storage/worker.ts`：SQLite（`node:sqlite`，WAL + busy_timeout）：目录表与 FTS5 全文索引、增量同步、已装缓存、操作历史。
 - `storage/client.ts`：worker 客户端。单次调用超时只拒绝该次调用并累加 `failedWrites`；worker 崩溃丢弃在途请求，下次调用重新拉起。**存储是旁路**，不阻塞浏览与管理。
 
 ## 浏览器
@@ -22,12 +22,15 @@
 - 不注册 `settings.section`：宿主设置面板可用宽度仅约 564px，市场大列表放不下。
 - React 由宿主 `window.__ModuleLoader__` 提供（`require("react")`），组件用 `h()` 手写；样式来自 `src/client.css`，作为 `<style>` 节点随面板挂载。
 - 布局契约：页面本身不滚动，只有 `.pc-body` 滚动。
+- 操作页排序口径：「进行中」按队列执行顺序显示（那是执行顺序，不是记录）；已完成记录
+  （「本次会话」与跨重启历史）一律按结束时间（缺则入队时间）**从新到旧**，与库里
+  `listOps` 的倒序一致。
 - **外链一律用 `<a target="_blank" rel="noopener noreferrer">`**，不用 `window.open`（宿主主窗口的
   `setWindowOpenHandler` 对 http/https 走 `shell.openExternal` 再 `deny`，所以真 `<a>` 才是
   「交给系统浏览器」的正确表达；`window.open` 还会被弹窗拦截）。外链地址**只能**由
   `siteUrl()` 从 `owner` + `slug` 拼出，绝不把目录数据直接塞进 `href`（见下）。
 
-## 数据流（M1 已实现）
+## 数据流
 
 ```
 dsh-plugin.org/zh/plugins ──┐  （索引页 253KB：shardManifest + sidebarStats）
@@ -103,7 +106,7 @@ dsh-plugin.org/zh/plugins ──┐  （索引页 253KB：shardManifest + sideba
 以上 2–4 尚未实现；要做的话按 1 → 2 → 3 的顺序，前两项是小改动，第 3 项需要一个不落库的
 取数与查询路径（新增一批测试）。
 
-## 已装事实与更新判据（M2）
+## 已装事实与更新判据
 
 ```
 profile/package.json ──┐
@@ -127,7 +130,7 @@ node_modules/<n>/*.json┘     （清单名/spec/选中、真实版本、仓库�
 - **出网纪律**：打开面板不检查更新；`updates.check` 必须由用户点按钮触发。
   出网域名：`dsh-plugin.org`、`api.dsh-plugin.org`、npm registry（可配镜像）、`github.com`。
 
-## 设置与诊断（M4）
+## 设置与诊断
 
 - **设置**存在 `<profile>/plugin-harbor/settings.json`（本插件自己的数据目录，与目录库同级），
   **原子写**（先写 `.tmp` 再 rename）。可配：语言、自动刷新间隔、官网/API 基址、registry、代理。
@@ -140,7 +143,7 @@ node_modules/<n>/*.json┘     （清单名/spec/选中、真实版本、仓库�
   口径：**只读**、**只在用户点按钮时跑**、单项失败不影响其它项、拿不到结论记 `ok: null`
   （与「失败」严格区分）。镜像没实现 `/-/ping` 时回 4xx 也算「可达」并说明。
 
-## 执行通道（M3 已实现）
+## 执行通道
 
 ```
 RPC（op.install / op.update / op.remove / op.setEnabled / op.list / op.cancel）
@@ -188,9 +191,8 @@ RPC（op.install / op.update / op.remove / op.setEnabled / op.list / op.cancel�
 
 热重载下宿主对已装包直接回 `already-installed`（它不能原地覆盖正在运行的模块），
 所以更新只能 `removeBundle` → `installBundle`。这条路的固有代价是：**卸载一旦成功、
-安装再失败，插件就从 profile 里消失了**。真实故障（2026-11-01，desktop profile）
-就是这么发生的：地址是范围 → pnpm 拒绝 → 旧版本已经卸掉，`dsh-cost-meter` 与
-`@liustack/modsearch` 双双从 `dependencies` 里没了。因此：
+安装再失败，插件就从 profile 里消失了**（例如地址是范围 → pnpm 拒绝 → 旧版本已经卸掉，
+`dependencies` 里就少了两个包）。因此：
 
 1. **地址先拼好、先验过再动手**：`op.update` 在**卸载之前**算出 `installSpec`
    （registry 带上更新检查核实到的目标版本，git / 路径按形态拼）并用 `validateSpec`
@@ -263,8 +265,6 @@ function siteUrl(row, siteBase) {
 基址跟随设置页的「站点基址」（自建镜像也对得上），不合法时返回空串、调用方**退回纯文本**
 （仓库名照常显示，只是不可点）。`tests/client.test.mjs` 里用 `javascript:alert(1)`、
 `../../etc`、带引号注入的串等逐个验证不出链接、也不丢整行。
-
-### 更新完成后自动复查被更新的那个插件
 
 ### 更新完成后自动复查被更新的那个插件
 
@@ -360,7 +360,7 @@ executeTask(update) ──► 结果（done / failed / cancelled …）
   路径写入」的事件，所以 `watchDist()` 先 `realpathSync`。watcher 与定时器都 `unref()`，
   空闲的桌面进程仍能正常退出。
 
-### 「怎么调 dsh」的解析（Windows 上的真实坑）
+### 「怎么调 dsh」的解析（Windows）
 
 `dsh` 在本机是 **`dsh.cmd` 批处理**，而 `spawn("dsh", args, { shell: false })` 会
 **ENOENT**（Node 不能直接执行 `.cmd`）；用户级 shim 在某些机器上还会报
@@ -408,8 +408,8 @@ op.import ──► 队列任务 "import" ──► 逐步 installBundle / setBu
   （`entryId` / `moduleName` / 启用状态）来自宿主 `pluginManager.listPlugins()`，服务不可用
   时这一节整个缺席并在 `warnings` 里说明 —— 不编一份空表。
 - **数据目录怎么归属**：候选名 = 包名 / 包名尾段 / **插件自己声明的行 id** / 宿主条目 id
-  （去掉 `include:` 前缀）。真实 profile 上 `dsh-channel-hub` 的目录就叫 `channel-hub`，
-  只按包名判断会在「宿主服务不可用」的离线场合把整个目录略过（真机预演抓到）。所有候选名
+  （去掉 `include:` 前缀）。例如 `dsh-channel-hub` 的数据目录就叫 `channel-hub`，
+  只按包名判断会在「宿主服务不可用」的离线场合把整个目录略过。所有候选名
   由 `dataDirCandidates()` 一处产出，「哪些目录在导出范围内」也只用 `ownedDataDirNames()`
   一个入口 —— 两处各写一套迟早会漂。
 - **凭据必须脱敏**：`config` 行、本插件设置、插件设置文件都要过脱敏（键名含
@@ -442,7 +442,7 @@ op.import ──► 队列任务 "import" ──► 逐步 installBundle / setBu
 才读当前的 `source`。文件优先级也按「刚选的 > 手填 > 下拉」固定，选过的文件不会被下拉框
 的默认值盖回去；选完还要清空 `input.value`，否则连续选同一个文件不会再触发 `change`。
 
-### 客户端与宿主的构建错配（真实踩坑：`Unknown method: export.run`）
+### 客户端与宿主的构建错配：版本握手与如实提示
 
 两半代码的**加载时机不同**：客户端的 `client.js` 是**页面加载时从磁盘现取**的；宿主侧
 `index.js` 是**进程启动 / 上次 profile 重新组合时载入**的。于是本插件是 `link:` 安装时会出现

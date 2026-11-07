@@ -52,7 +52,7 @@ https://dsh-plugin.org/directory/en/<category>-<page>-<hash>.json
   `/directory/<lang>/<cat>-<page>-<hash>.json` 的 URL 扫描兜底（`source: "url-scan"`，
   分类由文件名推出）。两级都为空时**不伪造空目录**，走 §4 兜底并在界面标降级。
 
-## 2.1 身份键：`repo` 而不是 `slug`（实测纠正）
+## 2.1 身份键：`repo` 而不是 `slug`
 
 站点数据里 **`slug` 会重名**：单分片 617 条中有 **23 组**重名，`dsh-purge` 同时
 属于 4 个不同仓库（yujunzhixue / kingcharleslzy-ai / mmparko / …）；而 `repo`
